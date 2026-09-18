@@ -1,3 +1,4 @@
+pub(crate) mod body;
 mod listener;
 mod relay;
 mod websocket;
@@ -12,6 +13,6 @@ pub(crate) async fn run<F>(config: Config, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()>,
 {
-    let (server, tls, routes) = config.into_parts();
-    listener::run(server, tls, routes, shutdown).await
+    let (server, tls, routes, grpc_routes) = config.into_parts();
+    listener::run(server, tls, routes, grpc_routes, shutdown).await
 }

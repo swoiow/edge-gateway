@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue, UPGRADE};
 use hyper::service::service_fn;
@@ -23,15 +22,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, TlsConfig};
+use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::websocket::WebSocketRuntime;
+use crate::grpc::{GrpcRouteTable, GrpcRuntime};
 use crate::routes::RouteTable;
-
-type ResponseBody = BoxBody<Bytes, Infallible>;
 
 pub(super) async fn run<F>(
     server_config: ServerConfig,
     tls_config: TlsConfig,
     routes: Arc<RouteTable>,
+    grpc_routes: Arc<GrpcRouteTable>,
     shutdown_signal: F,
 ) -> Result<()>
 where
@@ -46,15 +46,24 @@ where
     let cancellation = CancellationToken::new();
     let websocket_runtime =
         WebSocketRuntime::new(Arc::clone(&server_config), cancellation.child_token());
+    let grpc_runtime = GrpcRuntime::new(
+        grpc_routes,
+        server_config.backend_connect_timeout(),
+        server_config.max_grpc_concurrent_streams_per_backend(),
+        cancellation.child_token(),
+    );
     let service_state = ServiceState {
         routes: Arc::clone(&routes),
         websocket: websocket_runtime.clone(),
+        grpc: grpc_runtime.clone(),
     };
 
     info!(
         listen = %server_config.listen(),
-        configured_routes = routes.configured_count(),
-        enabled_routes = routes.enabled_count(),
+        configured_websocket_routes = routes.configured_count(),
+        enabled_websocket_routes = routes.enabled_count(),
+        configured_grpc_routes = grpc_runtime.configured_route_count(),
+        enabled_grpc_routes = grpc_runtime.enabled_route_count(),
         "gateway listener started"
     );
 
@@ -100,6 +109,7 @@ where
 
     cancellation.cancel();
     websocket_runtime.close();
+    grpc_runtime.close();
 
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
@@ -107,10 +117,13 @@ where
         }
     }
 
-    if timeout(server_config.shutdown_grace(), websocket_runtime.wait()).await.is_err() {
+    let data_plane_shutdown = async {
+        tokio::join!(websocket_runtime.wait(), grpc_runtime.wait());
+    };
+    if timeout(server_config.shutdown_grace(), data_plane_shutdown).await.is_err() {
         warn!(
             timeout_seconds = server_config.shutdown_grace().as_secs(),
-            "WebSocket relay tasks exceeded shutdown grace period"
+            "data-plane tasks exceeded shutdown grace period"
         );
     }
 
@@ -122,6 +135,7 @@ where
 struct ServiceState {
     routes: Arc<RouteTable>,
     websocket: WebSocketRuntime,
+    grpc: GrpcRuntime,
 }
 
 async fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
@@ -230,43 +244,49 @@ async fn handle_request(
     }
 
     let path = request.uri().path();
-    let Some(route) = state.routes.resolve(path) else {
-        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
-    };
+    if let Some(route) = state.routes.resolve(path) {
+        return match state.websocket.accept(request, Arc::clone(&route), peer).await {
+            Ok(response) => Ok(response.map(body::boxed)),
+            Err(error) => {
+                if error.is_backend_failure() {
+                    warn!(
+                        route_id = route.id(),
+                        route_class = route.namespace().as_str(),
+                        backend = route.backend().display(),
+                        %peer,
+                        error = %error,
+                        "WebSocket request rejected"
+                    );
+                } else {
+                    debug!(
+                        route_id = route.id(),
+                        route_class = route.namespace().as_str(),
+                        %peer,
+                        error = %error,
+                        "WebSocket request rejected"
+                    );
+                }
 
-    match state.websocket.accept(request, Arc::clone(&route), peer).await {
-        Ok(response) => Ok(response.map(BodyExt::boxed)),
-        Err(error) => {
-            if error.is_backend_failure() {
-                warn!(
-                    route_id = route.id(),
-                    route_class = route.namespace().as_str(),
-                    backend = route.backend().display(),
-                    %peer,
-                    error = %error,
-                    "WebSocket request rejected"
-                );
-            } else {
-                debug!(
-                    route_id = route.id(),
-                    route_class = route.namespace().as_str(),
-                    %peer,
-                    error = %error,
-                    "WebSocket request rejected"
-                );
+                let mut response = text_response(error.status(), error.public_message());
+                if error.status() == StatusCode::UPGRADE_REQUIRED {
+                    response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
+                }
+                Ok(response)
             }
-
-            let mut response = text_response(error.status(), error.public_message());
-            if error.status() == StatusCode::UPGRADE_REQUIRED {
-                response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
-            }
-            Ok(response)
-        }
+        };
     }
+
+    if let Some(route) = state.grpc.resolve(path) {
+        return Ok(state.grpc.proxy(request, route, peer).await);
+    }
+
+    Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
 }
 
-fn text_response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
-    let mut response = Response::new(Full::new(Bytes::from_static(body.as_bytes())).boxed());
+fn text_response(status: StatusCode, response_body: &'static str) -> Response<ResponseBody> {
+    let mut response = Response::new(body::boxed(Full::new(Bytes::from_static(
+        response_body.as_bytes(),
+    ))));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,

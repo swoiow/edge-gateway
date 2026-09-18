@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::grpc::{GrpcRouteError, GrpcRouteSpec, GrpcRouteTable};
 use crate::routes::{RouteError, RouteSpec, RouteTable};
 
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
@@ -13,17 +14,20 @@ const DEFAULT_WEBSOCKET_UPGRADE_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
 const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND: usize = 256;
 
 const MAX_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 300;
 const MAX_WEBSOCKET_UPGRADE_TIMEOUT_SECONDS: u64 = 300;
 const MAX_BACKEND_CONNECT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 600;
 const MAX_WEBSOCKET_MESSAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND: usize = 4096;
 
 pub(crate) struct Config {
     server: ServerConfig,
     tls: TlsConfig,
     routes: Arc<RouteTable>,
+    grpc_routes: Arc<GrpcRouteTable>,
 }
 
 impl Config {
@@ -42,8 +46,15 @@ impl Config {
         file_config.validate()
     }
 
-    pub(crate) fn into_parts(self) -> (ServerConfig, TlsConfig, Arc<RouteTable>) {
-        (self.server, self.tls, self.routes)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ServerConfig,
+        TlsConfig,
+        Arc<RouteTable>,
+        Arc<GrpcRouteTable>,
+    ) {
+        (self.server, self.tls, self.routes, self.grpc_routes)
     }
 }
 
@@ -54,6 +65,7 @@ pub(crate) struct ServerConfig {
     backend_connect_timeout: Duration,
     shutdown_grace: Duration,
     max_websocket_message_size: usize,
+    max_grpc_concurrent_streams_per_backend: usize,
 }
 
 impl ServerConfig {
@@ -80,6 +92,10 @@ impl ServerConfig {
     pub(crate) fn max_websocket_message_size(&self) -> usize {
         self.max_websocket_message_size
     }
+
+    pub(crate) fn max_grpc_concurrent_streams_per_backend(&self) -> usize {
+        self.max_grpc_concurrent_streams_per_backend
+    }
 }
 
 pub(crate) struct TlsConfig {
@@ -104,6 +120,8 @@ struct FileConfig {
     tls: FileTlsConfig,
     #[serde(default)]
     routes: Vec<FileRouteConfig>,
+    #[serde(default)]
+    grpc_routes: Vec<FileGrpcRouteConfig>,
 }
 
 impl FileConfig {
@@ -133,6 +151,11 @@ impl FileConfig {
             self.server.max_websocket_message_size_bytes,
             MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
         )?;
+        let max_grpc_concurrent_streams_per_backend = validate_count(
+            "server.max_grpc_concurrent_streams_per_backend",
+            self.server.max_grpc_concurrent_streams_per_backend,
+            MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND,
+        )?;
 
         validate_path("tls.cert", &self.tls.cert)?;
         validate_path("tls.key", &self.tls.key)?;
@@ -149,6 +172,18 @@ impl FileConfig {
             .collect();
         let routes = Arc::new(RouteTable::build(route_specs)?);
 
+        let grpc_route_specs = self
+            .grpc_routes
+            .into_iter()
+            .map(|route| GrpcRouteSpec {
+                id: route.id,
+                path: route.path,
+                backend: route.backend,
+                enabled: route.enabled,
+            })
+            .collect();
+        let grpc_routes = Arc::new(GrpcRouteTable::build(grpc_route_specs)?);
+
         Ok(Config {
             server: ServerConfig {
                 listen: self.server.listen,
@@ -157,12 +192,14 @@ impl FileConfig {
                 backend_connect_timeout,
                 shutdown_grace,
                 max_websocket_message_size,
+                max_grpc_concurrent_streams_per_backend,
             },
             tls: TlsConfig {
                 cert: self.tls.cert,
                 key: self.tls.key,
             },
             routes,
+            grpc_routes,
         })
     }
 }
@@ -181,6 +218,8 @@ struct FileServerConfig {
     shutdown_grace_seconds: u64,
     #[serde(default = "default_max_websocket_message_size_bytes")]
     max_websocket_message_size_bytes: usize,
+    #[serde(default = "default_max_grpc_concurrent_streams_per_backend")]
+    max_grpc_concurrent_streams_per_backend: usize,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +232,16 @@ struct FileTlsConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileRouteConfig {
+    id: String,
+    path: String,
+    backend: String,
+    #[serde(default = "default_route_enabled")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGrpcRouteConfig {
     id: String,
     path: String,
     backend: String,
@@ -216,8 +265,10 @@ pub(crate) enum ConfigError {
     },
     #[error("invalid configuration: {0}")]
     Invalid(String),
-    #[error("invalid route configuration: {0}")]
+    #[error("invalid WebSocket route configuration: {0}")]
     Route(#[from] RouteError),
+    #[error("invalid gRPC route configuration: {0}")]
+    GrpcRoute(#[from] GrpcRouteError),
 }
 
 fn validate_seconds(
@@ -254,6 +305,21 @@ fn validate_size(field: &'static str, value: usize, maximum: usize) -> Result<us
     Ok(value)
 }
 
+fn validate_count(field: &'static str, value: usize, maximum: usize) -> Result<usize, ConfigError> {
+    if value == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    if value > maximum {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not exceed {maximum}"
+        )));
+    }
+
+    Ok(value)
+}
+
 fn validate_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(format!("{field} must not be empty")));
@@ -280,6 +346,10 @@ const fn default_shutdown_grace_seconds() -> u64 {
 
 const fn default_max_websocket_message_size_bytes() -> usize {
     DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES
+}
+
+const fn default_max_grpc_concurrent_streams_per_backend() -> usize {
+    DEFAULT_MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND
 }
 
 const fn default_route_enabled() -> bool {

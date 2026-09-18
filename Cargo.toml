@@ -1,6 +1,6 @@
 [package]
 name = "edge-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "Cloudflare-facing Rust edge gateway for a V2Fly WebSocket backend"
@@ -10,7 +10,7 @@ anyhow = "1"
 bytes = "1"
 fastwebsockets = { version = "0.10", features = ["unstable-split", "upgrade"] }
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2"

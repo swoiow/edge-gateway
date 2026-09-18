@@ -1,5 +1,6 @@
 mod config;
 mod gateway;
+mod grpc;
 mod observability;
 mod routes;
 

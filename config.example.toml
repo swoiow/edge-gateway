@@ -1,0 +1,30 @@
+[server]
+listen = "0.0.0.0:8443"
+tls_handshake_timeout_seconds = 10
+websocket_upgrade_timeout_seconds = 10
+backend_connect_timeout_seconds = 3
+shutdown_grace_seconds = 120
+max_websocket_message_size_bytes = 1048576
+max_grpc_concurrent_streams_per_backend = 256
+
+[tls]
+cert = "certs/fullchain.pem"
+key = "certs/privkey.pem"
+
+[[routes]]
+id = "route-a"
+path = "/api/pc/a"
+backend = "ws://127.0.0.1:10002/v2fly"
+enabled = true
+
+[[routes]]
+id = "develop"
+path = "/api/uat/health"
+backend = "ws://127.0.0.1:10002/v2fly"
+enabled = true
+
+[[grpc_routes]]
+id = "grpc-tun"
+path = "/edge.Gateway/Tun"
+backend = "h2c://127.0.0.1:50051"
+enabled = true
