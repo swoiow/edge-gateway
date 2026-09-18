@@ -1,0 +1,49 @@
+[package]
+name = "edge-gateway"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Cloudflare-facing Rust edge gateway for a V2Fly WebSocket backend"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+fastwebsockets = { version = "0.10", features = ["unstable-split", "upgrade"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+opt-level = 3              # All optimizations (inline/vectorize/unroll). Documented: 3 can be slower than 2 — measure.
+debug = 0                  # Retain release; production parity — debuginfo would distort timing and layout.
+split-debuginfo = "off"    # Retain release; keep artifact self-contained, matching what ships.
+strip = "symbols"          # Retain release; bounds the bloat from opt-level 3's aggressive inlining/unrolling.
+debug-assertions = false   # Retain release; assertion branches would alter hot-path timing and mask real numbers.
+overflow-checks = false    # Retain release; overflow guards compound in tight numeric kernels.
+lto = true                 # Same value as release (true == "fat"); declared for visibility, NOT an override.
+panic = "abort"            # Retain release. CAVEAT: cargo test forces unwind + recompiles all deps — use bench instead.
+incremental = false        # Retain release; incremental would undermine cross-crate LTO.
+codegen-units = 1          # Retain release; mandatory for opt-level 3 + fat LTO to reach full effect.
+rpath = false              # Retain release; keep dynamic-linker metadata minimal for layout parity.
