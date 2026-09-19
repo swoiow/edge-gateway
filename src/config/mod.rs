@@ -22,10 +22,12 @@ const MAX_BACKEND_CONNECT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 600;
 const MAX_WEBSOCKET_MESSAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND: usize = 4096;
+const MAX_OBSERVABILITY_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
 pub(crate) struct Config {
     server: ServerConfig,
     tls: TlsConfig,
+    observability: ObservabilityConfig,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
 }
@@ -42,8 +44,8 @@ impl Config {
                 path: path.to_path_buf(),
                 source,
             })?;
-
-        file_config.validate()
+        let config_directory = path.parent().unwrap_or_else(|| Path::new("."));
+        file_config.validate(config_directory)
     }
 
     pub(crate) fn into_parts(
@@ -51,10 +53,17 @@ impl Config {
     ) -> (
         ServerConfig,
         TlsConfig,
+        ObservabilityConfig,
         Arc<RouteTable>,
         Arc<GrpcRouteTable>,
     ) {
-        (self.server, self.tls, self.routes, self.grpc_routes)
+        (
+            self.server,
+            self.tls,
+            self.observability,
+            self.routes,
+            self.grpc_routes,
+        )
     }
 }
 
@@ -113,11 +122,66 @@ impl TlsConfig {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) enum ObservabilityMode {
+    Off,
+    Production,
+    Diagnostic,
+}
+
+pub(crate) struct ObservabilityConfig {
+    mode: ObservabilityMode,
+    summary_interval: Duration,
+    summary_file: PathBuf,
+    diagnostic_interval: Duration,
+    diagnostic_file: PathBuf,
+    connection_event_logs_enabled: bool,
+}
+
+impl ObservabilityConfig {
+    pub(crate) fn mode(&self) -> ObservabilityMode {
+        self.mode
+    }
+
+    pub(crate) fn summary_interval(&self) -> Duration {
+        self.summary_interval
+    }
+
+    pub(crate) fn summary_file(&self) -> &Path {
+        &self.summary_file
+    }
+
+    pub(crate) fn diagnostic_interval(&self) -> Duration {
+        self.diagnostic_interval
+    }
+
+    pub(crate) fn diagnostic_file(&self) -> &Path {
+        &self.diagnostic_file
+    }
+
+    pub(crate) fn connection_event_logs_enabled(&self) -> bool {
+        self.connection_event_logs_enabled
+    }
+
+    fn off() -> Self {
+        Self {
+            mode: ObservabilityMode::Off,
+            summary_interval: Duration::from_secs(300),
+            summary_file: PathBuf::new(),
+            diagnostic_interval: Duration::from_secs(60),
+            diagnostic_file: PathBuf::new(),
+            connection_event_logs_enabled: false,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     server: FileServerConfig,
     tls: FileTlsConfig,
+    #[serde(default)]
+    observability: Option<FileObservabilityConfig>,
     #[serde(default)]
     routes: Vec<FileRouteConfig>,
     #[serde(default)]
@@ -125,7 +189,7 @@ struct FileConfig {
 }
 
 impl FileConfig {
-    fn validate(self) -> Result<Config, ConfigError> {
+    fn validate(self, config_directory: &Path) -> Result<Config, ConfigError> {
         let tls_handshake_timeout = validate_seconds(
             "server.tls_handshake_timeout_seconds",
             self.server.tls_handshake_timeout_seconds,
@@ -159,6 +223,12 @@ impl FileConfig {
 
         validate_path("tls.cert", &self.tls.cert)?;
         validate_path("tls.key", &self.tls.key)?;
+
+        let observability = self
+            .observability
+            .map(|config| config.validate(config_directory))
+            .transpose()?
+            .unwrap_or_else(ObservabilityConfig::off);
 
         let route_specs = self
             .routes
@@ -198,6 +268,7 @@ impl FileConfig {
                 cert: self.tls.cert,
                 key: self.tls.key,
             },
+            observability,
             routes,
             grpc_routes,
         })
@@ -227,6 +298,61 @@ struct FileServerConfig {
 struct FileTlsConfig {
     cert: PathBuf,
     key: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileObservabilityConfig {
+    mode: FileObservabilityMode,
+    summary_interval_seconds: u64,
+    summary_file: PathBuf,
+    diagnostic_interval_seconds: u64,
+    diagnostic_file: PathBuf,
+    connection_event_logs_enabled: bool,
+}
+
+impl FileObservabilityConfig {
+    fn validate(self, config_directory: &Path) -> Result<ObservabilityConfig, ConfigError> {
+        let summary_interval = validate_seconds(
+            "observability.summary_interval_seconds",
+            self.summary_interval_seconds,
+            MAX_OBSERVABILITY_INTERVAL_SECONDS,
+        )?;
+        let diagnostic_interval = validate_seconds(
+            "observability.diagnostic_interval_seconds",
+            self.diagnostic_interval_seconds,
+            MAX_OBSERVABILITY_INTERVAL_SECONDS,
+        )?;
+        validate_path("observability.summary_file", &self.summary_file)?;
+        validate_path("observability.diagnostic_file", &self.diagnostic_file)?;
+
+        Ok(ObservabilityConfig {
+            mode: self.mode.into(),
+            summary_interval,
+            summary_file: resolve_config_path(config_directory, self.summary_file),
+            diagnostic_interval,
+            diagnostic_file: resolve_config_path(config_directory, self.diagnostic_file),
+            connection_event_logs_enabled: self.connection_event_logs_enabled,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FileObservabilityMode {
+    Off,
+    Production,
+    Diagnostic,
+}
+
+impl From<FileObservabilityMode> for ObservabilityMode {
+    fn from(value: FileObservabilityMode) -> Self {
+        match value {
+            FileObservabilityMode::Off => Self::Off,
+            FileObservabilityMode::Production => Self::Production,
+            FileObservabilityMode::Diagnostic => Self::Diagnostic,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -326,6 +452,14 @@ fn validate_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn resolve_config_path(config_directory: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        config_directory.join(path)
+    }
 }
 
 const fn default_tls_handshake_timeout_seconds() -> u64 {

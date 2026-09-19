@@ -21,10 +21,11 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{GrpcBackendEndpoint, GrpcRoute, GrpcRouteTable};
 use crate::gateway::body::{self, ResponseBody};
+use crate::observability::RuntimeObservability;
 
 #[derive(Clone)]
 pub(crate) struct GrpcRuntime {
@@ -32,6 +33,7 @@ pub(crate) struct GrpcRuntime {
     upstreams: Arc<HashMap<SocketAddr, Arc<GrpcUpstream>>>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
+    observability: RuntimeObservability,
 }
 
 impl GrpcRuntime {
@@ -40,6 +42,7 @@ impl GrpcRuntime {
         connect_timeout: Duration,
         max_concurrent_streams_per_backend: usize,
         shutdown: CancellationToken,
+        observability: RuntimeObservability,
     ) -> Self {
         let tasks = TaskTracker::new();
         let executor = TrackedExecutor(tasks.clone());
@@ -63,6 +66,7 @@ impl GrpcRuntime {
             upstreams: Arc::new(upstreams),
             shutdown,
             tasks,
+            observability,
         }
     }
 
@@ -83,7 +87,37 @@ impl GrpcRuntime {
         request: Request<Incoming>,
         route: Arc<GrpcRoute>,
         peer: SocketAddr,
+        transport_connection_id: u64,
     ) -> Response<ResponseBody> {
+        let cf_ray = request
+            .headers()
+            .get("cf-ray")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if self.observability.connection_event_logs_enabled() {
+            info!(
+                transport_connection_id,
+                route_id = route.id(),
+                backend = route.backend().display(),
+                %peer,
+                cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                http_version = ?request.version(),
+                method = %request.method(),
+                "Cloudflare-facing gRPC request received"
+            );
+        } else {
+            debug!(
+                transport_connection_id,
+                route_id = route.id(),
+                backend = route.backend().display(),
+                %peer,
+                cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                http_version = ?request.version(),
+                method = %request.method(),
+                "Cloudflare-facing gRPC request received"
+            );
+        }
+
         if self.shutdown.is_cancelled() {
             return grpc_failure_response("14", "gateway%20shutting%20down");
         }
@@ -103,11 +137,6 @@ impl GrpcRuntime {
             );
         }
 
-        let cf_ray = request
-            .headers()
-            .get("cf-ray")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
         let Some(upstream) = self.upstreams.get(&route.backend().address()) else {
             warn!(
                 route_id = route.id(),

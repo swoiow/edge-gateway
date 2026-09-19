@@ -11,6 +11,14 @@ max_grpc_concurrent_streams_per_backend = 256
 cert = "certs/fullchain.pem"
 key = "certs/privkey.pem"
 
+[observability]
+mode = "production"
+summary_interval_seconds = 300
+summary_file = "observability-runtime-production.jsonl"
+diagnostic_interval_seconds = 60
+diagnostic_file = "observability-runtime-diagnostic.jsonl"
+connection_event_logs_enabled = false
+
 [[routes]]
 id = "route-a"
 path = "/api/pc/a"

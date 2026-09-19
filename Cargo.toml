@@ -1,9 +1,9 @@
 [package]
 name = "edge-gateway"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
-description = "Cloudflare-facing Rust edge gateway for a V2Fly WebSocket backend"
+description = "Cloudflare-facing Rust edge gateway for WebSocket/gRPC backend"
 
 [dependencies]
 anyhow = "1"
@@ -16,7 +16,7 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "r
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "1"
@@ -36,14 +36,14 @@ unimplemented = "deny"
 unwrap_used = "deny"
 
 [profile.release]
-opt-level = 3              # All optimizations (inline/vectorize/unroll). Documented: 3 can be slower than 2 — measure.
-debug = 0                  # Retain release; production parity — debuginfo would distort timing and layout.
-split-debuginfo = "off"    # Retain release; keep artifact self-contained, matching what ships.
-strip = "symbols"          # Retain release; bounds the bloat from opt-level 3's aggressive inlining/unrolling.
-debug-assertions = false   # Retain release; assertion branches would alter hot-path timing and mask real numbers.
-overflow-checks = false    # Retain release; overflow guards compound in tight numeric kernels.
-lto = true                 # Same value as release (true == "fat"); declared for visibility, NOT an override.
-panic = "abort"            # Retain release. CAVEAT: cargo test forces unwind + recompiles all deps — use bench instead.
-incremental = false        # Retain release; incremental would undermine cross-crate LTO.
-codegen-units = 1          # Retain release; mandatory for opt-level 3 + fat LTO to reach full effect.
-rpath = false              # Retain release; keep dynamic-linker metadata minimal for layout parity.
+opt-level = "z"
+debug = 0
+split-debuginfo = "off"
+strip = "symbols"
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -10,17 +10,18 @@ use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::header::{CONNECTION, HOST, UPGRADE};
 use hyper::upgrade::Upgraded;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
 use crate::gateway::relay;
 use crate::gateway::relay::ConnectionContext;
+use crate::observability::RuntimeObservability;
 use crate::routes::Route;
 
 type GatewayWebSocket = WebSocket<TokioIo<Upgraded>>;
@@ -31,18 +32,22 @@ pub(super) struct WebSocketRuntime {
     shutdown: CancellationToken,
     tasks: TaskTracker,
     executor: TrackedExecutor,
-    next_connection_id: Arc<AtomicU64>,
+    observability: RuntimeObservability,
 }
 
 impl WebSocketRuntime {
-    pub(super) fn new(server_config: Arc<ServerConfig>, shutdown: CancellationToken) -> Self {
+    pub(super) fn new(
+        server_config: Arc<ServerConfig>,
+        shutdown: CancellationToken,
+        observability: RuntimeObservability,
+    ) -> Self {
         let tasks = TaskTracker::new();
         Self {
             server_config,
             shutdown,
             executor: TrackedExecutor(tasks.clone()),
             tasks,
-            next_connection_id: Arc::new(AtomicU64::new(1)),
+            observability,
         }
     }
 
@@ -51,6 +56,7 @@ impl WebSocketRuntime {
         mut request: Request<Incoming>,
         route: Arc<Route>,
         peer: SocketAddr,
+        transport_connection_id: u64,
     ) -> Result<Response<Empty<Bytes>>, AcceptError> {
         if self.shutdown.is_cancelled() {
             return Err(AcceptError::ShuttingDown);
@@ -59,6 +65,8 @@ impl WebSocketRuntime {
             return Err(AcceptError::UpgradeRequired);
         }
 
+        let connection_id = self.observability.next_websocket_connection_id();
+        let downstream_http_version = http_version(request.version());
         let cf_ray = request
             .headers()
             .get("cf-ray")
@@ -67,6 +75,7 @@ impl WebSocketRuntime {
         let (response, downstream_upgrade) =
             upgrade::upgrade(&mut request).map_err(AcceptError::InvalidHandshake)?;
 
+        let backend_connect_started = Instant::now();
         let backend = tokio::select! {
             () = self.shutdown.cancelled() => return Err(AcceptError::ShuttingDown),
             result = timeout(
@@ -75,60 +84,126 @@ impl WebSocketRuntime {
             ) => {
                 match result {
                     Ok(Ok(backend)) => backend,
-                    Ok(Err(error)) => return Err(AcceptError::Backend(error)),
-                    Err(_) => return Err(AcceptError::BackendTimeout),
+                    Ok(Err(error)) => {
+                        self.observability.record_websocket_backend_connect_failure();
+                        warn!(
+                            transport_connection_id,
+                            connection_id,
+                            route_id = route.id(),
+                            route_class = route.namespace().as_str(),
+                            backend = route.backend().display(),
+                            %peer,
+                            cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                            connect_duration_ms = backend_connect_started.elapsed().as_millis(),
+                            error = %error,
+                            "V2Fly WebSocket backend connection failed"
+                        );
+                        return Err(AcceptError::Backend(error));
+                    }
+                    Err(_) => {
+                        self.observability.record_websocket_backend_connect_timeout();
+                        warn!(
+                            transport_connection_id,
+                            connection_id,
+                            route_id = route.id(),
+                            route_class = route.namespace().as_str(),
+                            backend = route.backend().display(),
+                            %peer,
+                            cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                            connect_duration_ms = backend_connect_started.elapsed().as_millis(),
+                            timeout_seconds = self.server_config.backend_connect_timeout().as_secs(),
+                            "V2Fly WebSocket backend connection timed out"
+                        );
+                        return Err(AcceptError::BackendTimeout);
+                    }
                 }
             }
         };
 
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown.child_token();
         let upgrade_timeout = self.server_config.websocket_upgrade_timeout();
         let max_message_size = self.server_config.max_websocket_message_size();
         let route_for_relay = Arc::clone(&route);
+        let observability = self.observability.clone();
+        let backend_connect_duration_ms = backend_connect_started.elapsed().as_millis();
 
         debug!(
+            transport_connection_id,
             connection_id,
             route_id = route.id(),
             route_class = route.namespace().as_str(),
             backend = route.backend().display(),
             %peer,
+            cf_ray = cf_ray.as_deref().unwrap_or("-"),
+            backend_connect_duration_ms,
             "V2Fly WebSocket backend connected"
         );
 
         let relay_task = self.tasks.spawn(async move {
+            let upgrade_started = Instant::now();
             let downstream = match timeout(upgrade_timeout, downstream_upgrade).await {
                 Ok(Ok(downstream)) => downstream,
                 Ok(Err(error)) => {
+                    observability.record_websocket_upgrade_failure();
                     warn!(
+                        transport_connection_id,
                         connection_id,
                         route_id = route_for_relay.id(),
                         route_class = route_for_relay.namespace().as_str(),
                         %peer,
+                        cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                        upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
                         error = %error,
                         "downstream WebSocket upgrade failed"
                     );
                     return;
                 }
                 Err(_) => {
+                    observability.record_websocket_upgrade_timeout();
                     warn!(
+                        transport_connection_id,
                         connection_id,
                         route_id = route_for_relay.id(),
                         route_class = route_for_relay.namespace().as_str(),
                         %peer,
+                        cf_ray = cf_ray.as_deref().unwrap_or("-"),
                         timeout_seconds = upgrade_timeout.as_secs(),
+                        upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
                         "downstream WebSocket upgrade timed out"
                     );
                     return;
                 }
             };
 
+            let active_connection = observability.begin_websocket_connection();
+            if observability.connection_event_logs_enabled() {
+                info!(
+                    transport_connection_id,
+                    connection_id,
+                    route_id = route_for_relay.id(),
+                    route_class = route_for_relay.namespace().as_str(),
+                    backend = route_for_relay.backend().display(),
+                    %peer,
+                    cf_ray = cf_ray.as_deref().unwrap_or("-"),
+                    downstream_http_version,
+                    backend_connect_duration_ms,
+                    upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
+                    active_websocket_connections = active_connection.active_connections(),
+                    peak_websocket_connections = observability.peak_websocket_connections(),
+                    "Cloudflare-facing WebSocket connection established"
+                );
+            }
+
             relay::run(
                 ConnectionContext {
+                    transport_connection_id,
                     connection_id,
                     peer,
                     route: route_for_relay,
                     cf_ray,
+                    downstream_http_version,
+                    active_connection,
+                    observability,
                 },
                 downstream,
                 backend,
@@ -177,6 +252,17 @@ async fn connect_backend(route: &Route, executor: &TrackedExecutor) -> Result<Ga
         .await
         .context("V2Fly WebSocket handshake failed")?;
     Ok(websocket)
+}
+
+fn http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
+        _ => "unknown",
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
