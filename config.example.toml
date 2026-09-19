@@ -17,7 +17,7 @@ summary_interval_seconds = 300
 summary_file = "observability-runtime-production.jsonl"
 diagnostic_interval_seconds = 60
 diagnostic_file = "observability-runtime-diagnostic.jsonl"
-connection_event_logs_enabled = false
+connection_event_logs_enabled = true
 
 [[routes]]
 id = "route-a"

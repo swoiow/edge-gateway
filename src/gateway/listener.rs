@@ -275,7 +275,8 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
         handle_request(request, state.clone(), peer, transport_connection_id)
     });
     let io = TokioIo::new(tls_stream);
-    let builder = AutoConnectionBuilder::new(TokioExecutor::new());
+    let mut builder = AutoConnectionBuilder::new(TokioExecutor::new());
+    builder.http2().enable_connect_protocol();
     let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
 
@@ -369,7 +370,7 @@ async fn handle_request(
             .accept(request, Arc::clone(&route), peer, transport_connection_id)
             .await
         {
-            Ok(response) => Ok(response.map(body::boxed)),
+            Ok(response) => Ok(response),
             Err(error) => {
                 if error.is_backend_failure() {
                     warn!(
@@ -393,7 +394,7 @@ async fn handle_request(
                 }
 
                 let mut response = text_response(error.status(), error.public_message());
-                if error.status() == StatusCode::UPGRADE_REQUIRED {
+                if error.should_advertise_http1_upgrade() {
                     response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
                 }
                 Ok(response)

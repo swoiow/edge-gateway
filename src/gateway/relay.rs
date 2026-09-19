@@ -4,11 +4,12 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fastwebsockets::{
-    FragmentCollectorRead, Frame, OpCode, WebSocket, WebSocketError, WebSocketWrite,
+    FragmentCollectorRead, Frame, OpCode, Role, WebSocket, WebSocketError, WebSocketRead,
+    WebSocketWrite, after_handshake_split,
 };
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use tokio::io::{ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{interval_at, timeout};
@@ -21,10 +22,39 @@ use crate::observability::{
 };
 use crate::routes::Route;
 
-type GatewayWebSocket = WebSocket<TokioIo<Upgraded>>;
-type GatewayRead = FragmentCollectorRead<ReadHalf<TokioIo<Upgraded>>>;
-type GatewayWrite = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
+type BoxedRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
+type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
+type GatewayRead = FragmentCollectorRead<BoxedRead>;
+type GatewaySocketRead = WebSocketRead<BoxedRead>;
+type GatewayWrite = WebSocketWrite<BoxedWrite>;
 type SharedWriter = Arc<Mutex<GatewayWrite>>;
+
+pub(super) struct RelaySocket {
+    read: GatewaySocketRead,
+    write: GatewayWrite,
+}
+
+impl RelaySocket {
+    pub(super) fn from_upgraded_websocket(
+        websocket: WebSocket<TokioIo<Upgraded>>,
+        role: Role,
+    ) -> Self {
+        let stream = websocket.into_inner();
+        let (read, write) = tokio::io::split(stream);
+        Self::from_io_halves(read, write, role)
+    }
+
+    pub(super) fn from_io_halves<R, W>(read: R, write: W, role: Role) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let read: BoxedRead = Box::new(read);
+        let write: BoxedWrite = Box::new(write);
+        let (read, write) = after_handshake_split(read, write, role);
+        Self { read, write }
+    }
+}
 
 const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const SHORT_LIVED_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
@@ -43,22 +73,20 @@ pub(super) struct ConnectionContext {
 
 pub(super) async fn run(
     context: ConnectionContext,
-    mut downstream: GatewayWebSocket,
-    mut backend: GatewayWebSocket,
+    mut downstream: RelaySocket,
+    mut backend: RelaySocket,
     shutdown: CancellationToken,
     max_message_size: usize,
 ) {
     let started = Instant::now();
     let sdk_message_limit = max_message_size.saturating_add(1);
-    downstream.set_max_message_size(sdk_message_limit);
-    backend.set_max_message_size(sdk_message_limit);
+    downstream.read.set_max_message_size(sdk_message_limit);
+    backend.read.set_max_message_size(sdk_message_limit);
 
-    let (downstream_read, downstream_write) = downstream.split(tokio::io::split);
-    let (backend_read, backend_write) = backend.split(tokio::io::split);
-    let downstream_read = FragmentCollectorRead::new(downstream_read);
-    let backend_read = FragmentCollectorRead::new(backend_read);
-    let downstream_write = Arc::new(Mutex::new(downstream_write));
-    let backend_write = Arc::new(Mutex::new(backend_write));
+    let downstream_read = FragmentCollectorRead::new(downstream.read);
+    let backend_read = FragmentCollectorRead::new(backend.read);
+    let downstream_write = Arc::new(Mutex::new(downstream.write));
+    let backend_write = Arc::new(Mutex::new(backend.write));
 
     if !context.observability.connection_event_logs_enabled() {
         debug!(
