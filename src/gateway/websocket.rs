@@ -3,13 +3,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use fastwebsockets::{Role, WebSocket, WebSocketError, handshake, upgrade};
 use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::ext::Protocol;
-use hyper::header::{CONNECTION, HOST, UPGRADE};
+use hyper::header::{
+    AUTHORIZATION, CONNECTION, HOST, HeaderValue, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+};
 use hyper::upgrade::Upgraded;
 use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::TokioIo;
@@ -72,6 +74,7 @@ impl WebSocketRuntime {
         }
 
         let handshake_kind = validate_downstream_handshake(&request)?;
+        let backend_headers = BackendHandshakeHeaders::from_downstream(&request)?;
         let connection_id = self.observability.next_websocket_connection_id();
         let downstream_http_version = http_version(request.version());
         let cf_ray = request
@@ -101,7 +104,12 @@ impl WebSocketRuntime {
             () = self.shutdown.cancelled() => return Err(AcceptError::ShuttingDown),
             result = timeout(
                 self.server_config.backend_connect_timeout(),
-                connect_backend(&route, &self.executor, &backend_metadata),
+                connect_backend(
+                    &route,
+                    &self.executor,
+                    &backend_metadata,
+                    &backend_headers,
+                ),
             ) => {
                 match result {
                     Ok(Ok(backend)) => backend,
@@ -118,7 +126,7 @@ impl WebSocketRuntime {
                             downstream_http_version,
                             downstream_handshake = handshake_kind.as_str(),
                             connect_duration_ms = backend_connect_started.elapsed().as_millis(),
-                            error = %error,
+                            error = ?error,
                             "WebSocket backend connection failed"
                         );
                         return Err(AcceptError::Backend(error));
@@ -159,12 +167,19 @@ impl WebSocketRuntime {
             backend_connect_duration_ms,
             "WebSocket backend connected"
         );
+        let BackendConnection {
+            websocket: backend,
+            selected_subprotocol,
+        } = backend;
 
         match handshake_kind {
             DownstreamHandshake::Http1Upgrade => {
-                let Some((response, downstream_upgrade)) = h1_upgrade else {
+                let Some((mut response, downstream_upgrade)) = h1_upgrade else {
                     return Err(AcceptError::InvalidInternalState);
                 };
+                if let Some(protocol) = selected_subprotocol {
+                    response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+                }
                 self.spawn_http1_relay(
                     downstream_upgrade,
                     backend,
@@ -206,6 +221,9 @@ impl WebSocketRuntime {
 
                 let mut response = Response::new(body::boxed(response_body));
                 *response.status_mut() = StatusCode::OK;
+                if let Some(protocol) = selected_subprotocol {
+                    response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+                }
                 Ok(response)
             }
         }
@@ -364,7 +382,8 @@ async fn connect_backend(
     route: &Route,
     executor: &TrackedExecutor,
     metadata: &BackendHandshakeMetadata,
-) -> Result<GatewayWebSocket> {
+    headers: &BackendHandshakeHeaders,
+) -> Result<BackendConnection> {
     let stream = TcpStream::connect(route.backend().address()).await.with_context(|| {
         format!(
             "failed to connect to WebSocket backend {}",
@@ -402,14 +421,59 @@ async fn connect_backend(
         }
     }
 
-    let request = request
+    let mut request = request
         .body(Empty::<Bytes>::new())
         .context("failed to build WebSocket backend handshake request")?;
+    if let Some(authorization) = &headers.authorization {
+        request.headers_mut().insert(AUTHORIZATION, authorization.clone());
+    }
+    for protocol in &headers.websocket_protocols {
+        request.headers_mut().append(SEC_WEBSOCKET_PROTOCOL, protocol.clone());
+    }
 
-    let (websocket, _response) = handshake::client(executor, request, stream)
+    let (websocket, response) = handshake::client(executor, request, stream)
         .await
         .context("WebSocket backend handshake failed")?;
-    Ok(websocket)
+    let selected_subprotocol =
+        validate_backend_subprotocol(response.headers(), &headers.websocket_protocols)?;
+    Ok(BackendConnection {
+        websocket,
+        selected_subprotocol,
+    })
+}
+
+fn validate_backend_subprotocol(
+    response_headers: &hyper::HeaderMap,
+    offered_protocols: &[HeaderValue],
+) -> Result<Option<HeaderValue>> {
+    let mut selected = response_headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    let Some(selected_protocol) = selected.next() else {
+        return Ok(None);
+    };
+    if selected.next().is_some() || selected_protocol.as_bytes().contains(&b',') {
+        bail!("WebSocket backend selected multiple subprotocols");
+    }
+
+    let is_offered = offered_protocols.iter().any(|offered| {
+        offered
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| trim_ascii_whitespace(token) == selected_protocol.as_bytes())
+    });
+    if !is_offered {
+        bail!("WebSocket backend selected a subprotocol not offered downstream");
+    }
+    Ok(Some(selected_protocol.clone()))
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn validate_downstream_handshake(
@@ -480,6 +544,32 @@ struct BackendHandshakeMetadata {
     downstream_handshake: &'static str,
 }
 
+struct BackendHandshakeHeaders {
+    authorization: Option<HeaderValue>,
+    websocket_protocols: Vec<HeaderValue>,
+}
+
+impl BackendHandshakeHeaders {
+    fn from_downstream(request: &Request<Incoming>) -> Result<Self, AcceptError> {
+        let mut authorizations = request.headers().get_all(AUTHORIZATION).iter();
+        let authorization = authorizations.next().cloned();
+        if authorizations.next().is_some() {
+            return Err(AcceptError::AmbiguousAuthorization);
+        }
+        let websocket_protocols =
+            request.headers().get_all(SEC_WEBSOCKET_PROTOCOL).iter().cloned().collect();
+        Ok(Self {
+            authorization,
+            websocket_protocols,
+        })
+    }
+}
+
+struct BackendConnection {
+    websocket: GatewayWebSocket,
+    selected_subprotocol: Option<HeaderValue>,
+}
+
 struct RelayLaunchContext {
     transport_connection_id: u64,
     connection_id: u64,
@@ -501,6 +591,8 @@ pub(super) enum AcceptError {
     UnsupportedHttpVersion,
     #[error("invalid WebSocket handshake: {0}")]
     InvalidHandshake(#[source] WebSocketError),
+    #[error("WebSocket request contains multiple Authorization headers")]
+    AmbiguousAuthorization,
     #[error("gateway entered an invalid WebSocket handshake state")]
     InvalidInternalState,
     #[error("gateway is shutting down")]
@@ -515,9 +607,9 @@ impl AcceptError {
     pub(super) const fn status(&self) -> StatusCode {
         match self {
             Self::Http1UpgradeRequired => StatusCode::UPGRADE_REQUIRED,
-            Self::Http2ExtendedConnectRequired | Self::InvalidHandshake(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::Http2ExtendedConnectRequired
+            | Self::InvalidHandshake(_)
+            | Self::AmbiguousAuthorization => StatusCode::BAD_REQUEST,
             Self::UnsupportedHttpVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             Self::InvalidInternalState => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -533,6 +625,7 @@ impl AcceptError {
             }
             Self::UnsupportedHttpVersion => "unsupported websocket HTTP version\n",
             Self::InvalidHandshake(_) => "invalid websocket handshake\n",
+            Self::AmbiguousAuthorization => "invalid websocket authorization headers\n",
             Self::InvalidInternalState => "internal websocket state error\n",
             Self::ShuttingDown => "gateway is shutting down\n",
             Self::BackendTimeout | Self::Backend(_) => "backend unavailable\n",
