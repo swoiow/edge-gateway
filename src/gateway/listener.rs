@@ -242,16 +242,19 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
     };
     observability.record_tls_handshake_success();
 
-    let alpn = tls_stream
-        .get_ref()
-        .1
+    let (_, tls_connection) = tls_stream.get_ref();
+
+    let alpn = tls_connection
         .alpn_protocol()
         .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
         .unwrap_or_else(|| "none".to_owned());
+
     if observability.connection_event_logs_enabled() {
+        let sni = tls_connection.server_name().map(|name| name.to_owned());
         info!(
             transport_connection_id,
             %peer,
+            ?sni,
             %alpn,
             handshake_duration_ms = handshake_started.elapsed().as_millis(),
             active_transport_connections = active_connection.active_connections(),
