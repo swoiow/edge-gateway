@@ -125,11 +125,15 @@ impl RouteNamespace {
     }
 }
 
-pub(crate) struct BackendEndpoint {
-    display: Arc<str>,
-    address: SocketAddr,
-    request_target: Uri,
-    host_header: HeaderValue,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendKind {
+    WebSocket,
+    Tcp,
+}
+
+pub(crate) enum BackendEndpoint {
+    WebSocket(WebSocketBackendEndpoint),
+    Tcp(TcpBackendEndpoint),
 }
 
 impl BackendEndpoint {
@@ -139,42 +143,59 @@ impl BackendEndpoint {
             reason: source.to_string(),
         })?;
 
-        if uri.scheme_str() != Some("ws") {
-            return Err(RouteError::InvalidBackend {
+        match uri.scheme_str() {
+            Some("ws") => WebSocketBackendEndpoint::from_uri(value, &uri).map(Self::WebSocket),
+            Some("tcp") => TcpBackendEndpoint::from_uri(value, &uri).map(Self::Tcp),
+            Some(scheme) => Err(RouteError::InvalidBackend {
                 backend: value.to_owned(),
-                reason: "scheme must be ws".to_owned(),
-            });
-        }
-
-        let authority = uri.authority().ok_or_else(|| RouteError::InvalidBackend {
-            backend: value.to_owned(),
-            reason: "authority is required".to_owned(),
-        })?;
-
-        if authority.as_str().contains('@') {
-            return Err(RouteError::InvalidBackend {
+                reason: format!("unsupported scheme {scheme:?}; expected ws or tcp"),
+            }),
+            None => Err(RouteError::InvalidBackend {
                 backend: value.to_owned(),
-                reason: "userinfo is not allowed".to_owned(),
-            });
+                reason: "scheme is required; expected ws or tcp".to_owned(),
+            }),
         }
+    }
 
-        let host = uri.host().ok_or_else(|| RouteError::InvalidBackend {
-            backend: value.to_owned(),
-            reason: "host is required".to_owned(),
-        })?;
-        let ip = host.parse::<IpAddr>().map_err(|_| RouteError::InvalidBackend {
-            backend: value.to_owned(),
-            reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
-        })?;
-
-        if !ip.is_loopback() {
-            return Err(RouteError::InvalidBackend {
-                backend: value.to_owned(),
-                reason: "host must be a loopback address".to_owned(),
-            });
+    pub(crate) const fn kind(&self) -> BackendKind {
+        match self {
+            Self::WebSocket(_) => BackendKind::WebSocket,
+            Self::Tcp(_) => BackendKind::Tcp,
         }
+    }
 
-        let port = uri.port_u16().unwrap_or(80);
+    pub(crate) fn display(&self) -> &str {
+        match self {
+            Self::WebSocket(endpoint) => endpoint.display(),
+            Self::Tcp(endpoint) => endpoint.display(),
+        }
+    }
+
+    pub(crate) const fn address(&self) -> SocketAddr {
+        match self {
+            Self::WebSocket(endpoint) => endpoint.address(),
+            Self::Tcp(endpoint) => endpoint.address(),
+        }
+    }
+
+    pub(crate) fn websocket(&self) -> Option<&WebSocketBackendEndpoint> {
+        match self {
+            Self::WebSocket(endpoint) => Some(endpoint),
+            Self::Tcp(_) => None,
+        }
+    }
+}
+
+pub(crate) struct WebSocketBackendEndpoint {
+    display: Arc<str>,
+    address: SocketAddr,
+    request_target: Uri,
+    host_header: HeaderValue,
+}
+
+impl WebSocketBackendEndpoint {
+    fn from_uri(value: &str, uri: &Uri) -> Result<Self, RouteError> {
+        let (address, authority) = parse_loopback_authority(value, uri, Some(80), false)?;
         let request_target = uri
             .path_and_query()
             .map(|value| value.as_str())
@@ -184,16 +205,15 @@ impl BackendEndpoint {
                 backend: value.to_owned(),
                 reason: format!("invalid request target: {source}"),
             })?;
-        let host_header = HeaderValue::from_str(authority.as_str()).map_err(|source| {
-            RouteError::InvalidBackend {
+        let host_header =
+            HeaderValue::from_str(authority).map_err(|source| RouteError::InvalidBackend {
                 backend: value.to_owned(),
                 reason: format!("invalid authority: {source}"),
-            }
-        })?;
+            })?;
 
         Ok(Self {
             display: Arc::from(value),
-            address: SocketAddr::new(ip, port),
+            address,
             request_target,
             host_header,
         })
@@ -203,7 +223,7 @@ impl BackendEndpoint {
         &self.display
     }
 
-    pub(crate) fn address(&self) -> SocketAddr {
+    pub(crate) const fn address(&self) -> SocketAddr {
         self.address
     }
 
@@ -214,6 +234,87 @@ impl BackendEndpoint {
     pub(crate) fn host_header(&self) -> &HeaderValue {
         &self.host_header
     }
+}
+
+pub(crate) struct TcpBackendEndpoint {
+    display: Arc<str>,
+    address: SocketAddr,
+}
+
+impl TcpBackendEndpoint {
+    fn from_uri(value: &str, uri: &Uri) -> Result<Self, RouteError> {
+        let (address, _authority) = parse_loopback_authority(value, uri, None, true)?;
+        let request_target = uri.path_and_query().map(|value| value.as_str()).unwrap_or("/");
+        if request_target != "/" {
+            return Err(RouteError::InvalidBackend {
+                backend: value.to_owned(),
+                reason: "tcp backend URL must not contain a path or query".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            display: Arc::from(value),
+            address,
+        })
+    }
+
+    pub(crate) fn display(&self) -> &str {
+        &self.display
+    }
+
+    pub(crate) const fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+fn parse_loopback_authority<'a>(
+    value: &str,
+    uri: &'a Uri,
+    default_port: Option<u16>,
+    require_explicit_port: bool,
+) -> Result<(SocketAddr, &'a str), RouteError> {
+    let authority = uri.authority().ok_or_else(|| RouteError::InvalidBackend {
+        backend: value.to_owned(),
+        reason: "authority is required".to_owned(),
+    })?;
+
+    if authority.as_str().contains('@') {
+        return Err(RouteError::InvalidBackend {
+            backend: value.to_owned(),
+            reason: "userinfo is not allowed".to_owned(),
+        });
+    }
+
+    let host = uri.host().ok_or_else(|| RouteError::InvalidBackend {
+        backend: value.to_owned(),
+        reason: "host is required".to_owned(),
+    })?;
+    let ip = host.parse::<IpAddr>().map_err(|_| RouteError::InvalidBackend {
+        backend: value.to_owned(),
+        reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
+    })?;
+    if !ip.is_loopback() {
+        return Err(RouteError::InvalidBackend {
+            backend: value.to_owned(),
+            reason: "host must be a loopback address".to_owned(),
+        });
+    }
+
+    let port = match uri.port_u16() {
+        Some(port) => port,
+        None if require_explicit_port => {
+            return Err(RouteError::InvalidBackend {
+                backend: value.to_owned(),
+                reason: "an explicit port is required".to_owned(),
+            });
+        }
+        None => default_port.ok_or_else(|| RouteError::InvalidBackend {
+            backend: value.to_owned(),
+            reason: "an explicit port is required".to_owned(),
+        })?,
+    };
+
+    Ok((SocketAddr::new(ip, port), authority.as_str()))
 }
 
 #[derive(Debug, Error)]
@@ -287,7 +388,7 @@ fn validate_public_path(path: &str) -> Result<RouteNamespace, RouteError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteNamespace, validate_public_path};
+    use super::{BackendEndpoint, BackendKind, RouteNamespace, validate_public_path};
 
     #[test]
     fn custom_absolute_paths_are_allowed() {
@@ -311,6 +412,48 @@ mod tests {
             assert!(
                 validate_public_path(path).is_err(),
                 "{path:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_backend_remains_supported() {
+        let parsed = BackendEndpoint::parse("ws://127.0.0.1:9000/socket");
+        assert!(parsed.is_ok());
+        let Ok(backend) = parsed else {
+            return;
+        };
+        assert_eq!(backend.kind(), BackendKind::WebSocket);
+        assert_eq!(backend.address().to_string(), "127.0.0.1:9000");
+        assert_eq!(
+            backend.websocket().map(|endpoint| endpoint.request_target().to_string()),
+            Some("/socket".to_owned())
+        );
+    }
+
+    #[test]
+    fn tcp_backend_is_supported_without_protocol_rewrapping() {
+        let parsed = BackendEndpoint::parse("tcp://127.0.0.1:33301");
+        assert!(parsed.is_ok());
+        let Ok(backend) = parsed else {
+            return;
+        };
+        assert_eq!(backend.kind(), BackendKind::Tcp);
+        assert_eq!(backend.address().to_string(), "127.0.0.1:33301");
+        assert!(backend.websocket().is_none());
+    }
+
+    #[test]
+    fn tcp_backend_requires_loopback_explicit_port_and_no_path() {
+        for backend in [
+            "tcp://127.0.0.1",
+            "tcp://10.0.0.1:33301",
+            "tcp://127.0.0.1:33301/path",
+            "tcp://127.0.0.1:33301/?x=1",
+        ] {
+            assert!(
+                BackendEndpoint::parse(backend).is_err(),
+                "{backend:?} should be rejected"
             );
         }
     }

@@ -1,3 +1,3 @@
 mod table;
 
-pub(crate) use table::{Route, RouteError, RouteNamespace, RouteSpec, RouteTable};
+pub(crate) use table::{BackendKind, Route, RouteError, RouteNamespace, RouteSpec, RouteTable};

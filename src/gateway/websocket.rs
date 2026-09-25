@@ -26,7 +26,7 @@ use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::h2_websocket::split_extended_connect_body;
 use crate::gateway::relay::{self, ConnectionContext, RelaySocket};
 use crate::observability::RuntimeObservability;
-use crate::routes::{Route, RouteNamespace};
+use crate::routes::{BackendKind, Route, RouteNamespace};
 
 type GatewayWebSocket = WebSocket<TokioIo<Upgraded>>;
 
@@ -167,10 +167,7 @@ impl WebSocketRuntime {
             backend_connect_duration_ms,
             "WebSocket backend connected"
         );
-        let BackendConnection {
-            websocket: backend,
-            selected_subprotocol,
-        } = backend;
+        let selected_subprotocol = backend.selected_subprotocol().cloned();
 
         match handshake_kind {
             DownstreamHandshake::Http1Upgrade => {
@@ -202,22 +199,25 @@ impl WebSocketRuntime {
                     split_extended_connect_body(request_body);
                 let downstream =
                     RelaySocket::from_io_halves(downstream_read, downstream_write, Role::Server);
-                let backend = RelaySocket::from_upgraded_websocket(backend, Role::Client);
-                self.spawn_established_relay(
-                    downstream,
-                    backend,
-                    RelayLaunchContext {
-                        transport_connection_id,
-                        connection_id,
-                        peer,
-                        route,
-                        cf_ray,
-                        downstream_http_version,
-                        downstream_handshake: handshake_kind.as_str(),
-                        backend_connect_duration_ms,
-                    },
-                    0,
-                );
+                let launch_context = RelayLaunchContext {
+                    transport_connection_id,
+                    connection_id,
+                    peer,
+                    route,
+                    cf_ray,
+                    downstream_http_version,
+                    downstream_handshake: handshake_kind.as_str(),
+                    backend_connect_duration_ms,
+                };
+                match backend {
+                    BackendConnection::WebSocket { websocket, .. } => {
+                        let backend = RelaySocket::from_upgraded_websocket(websocket, Role::Client);
+                        self.spawn_established_relay(downstream, backend, launch_context, 0);
+                    }
+                    BackendConnection::Tcp { stream } => {
+                        self.spawn_established_tcp_bridge(downstream, stream, launch_context, 0);
+                    }
+                }
 
                 let mut response = Response::new(body::boxed(response_body));
                 *response.status_mut() = StatusCode::OK;
@@ -232,7 +232,7 @@ impl WebSocketRuntime {
     fn spawn_http1_relay(
         &self,
         downstream_upgrade: upgrade::UpgradeFut,
-        backend: GatewayWebSocket,
+        backend: BackendConnection,
         context: RelayLaunchContext,
     ) {
         let shutdown = self.shutdown.child_token();
@@ -280,17 +280,33 @@ impl WebSocketRuntime {
             };
 
             let downstream = RelaySocket::from_upgraded_websocket(downstream, Role::Server);
-            let backend = RelaySocket::from_upgraded_websocket(backend, Role::Client);
-            start_relay(
-                downstream,
-                backend,
-                context,
-                observability,
-                shutdown,
-                max_message_size,
-                upgrade_started.elapsed().as_millis(),
-            )
-            .await;
+            match backend {
+                BackendConnection::WebSocket { websocket, .. } => {
+                    let backend = RelaySocket::from_upgraded_websocket(websocket, Role::Client);
+                    start_relay(
+                        downstream,
+                        backend,
+                        context,
+                        observability,
+                        shutdown,
+                        max_message_size,
+                        upgrade_started.elapsed().as_millis(),
+                    )
+                    .await;
+                }
+                BackendConnection::Tcp { stream } => {
+                    start_tcp_bridge(
+                        downstream,
+                        stream,
+                        context,
+                        observability,
+                        shutdown,
+                        max_message_size,
+                        upgrade_started.elapsed().as_millis(),
+                    )
+                    .await;
+                }
+            }
         });
         std::mem::drop(relay_task);
     }
@@ -308,6 +324,32 @@ impl WebSocketRuntime {
         let tasks = self.tasks.clone();
         let relay_task = tasks.spawn(async move {
             start_relay(
+                downstream,
+                backend,
+                context,
+                observability,
+                shutdown,
+                max_message_size,
+                handshake_duration_ms,
+            )
+            .await;
+        });
+        std::mem::drop(relay_task);
+    }
+
+    fn spawn_established_tcp_bridge(
+        &self,
+        downstream: RelaySocket,
+        backend: TcpStream,
+        context: RelayLaunchContext,
+        handshake_duration_ms: u128,
+    ) {
+        let shutdown = self.shutdown.child_token();
+        let max_message_size = self.server_config.max_websocket_message_size();
+        let observability = self.observability.clone();
+        let tasks = self.tasks.clone();
+        let relay_task = tasks.spawn(async move {
+            start_tcp_bridge(
                 downstream,
                 backend,
                 context,
@@ -378,16 +420,96 @@ async fn start_relay(
     .await;
 }
 
+async fn start_tcp_bridge(
+    downstream: RelaySocket,
+    backend: TcpStream,
+    context: RelayLaunchContext,
+    observability: RuntimeObservability,
+    shutdown: CancellationToken,
+    max_message_size: usize,
+    handshake_duration_ms: u128,
+) {
+    let active_connection = observability.begin_websocket_connection();
+    if observability.connection_event_logs_enabled() {
+        info!(
+            transport_connection_id = context.transport_connection_id,
+            connection_id = context.connection_id,
+            route_id = context.route.id(),
+            route_class = context.route.namespace().as_str(),
+            backend = context.route.backend().display(),
+            backend_transport = "tcp",
+            peer = %context.peer,
+            cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
+            downstream_http_version = context.downstream_http_version,
+            downstream_handshake = context.downstream_handshake,
+            backend_connect_duration_ms = context.backend_connect_duration_ms,
+            handshake_duration_ms,
+            active_websocket_connections = active_connection.active_connections(),
+            peak_websocket_connections = observability.peak_websocket_connections(),
+            "Cloudflare-facing WebSocket-to-TCP connection established"
+        );
+    }
+
+    relay::run_tcp_backend(
+        ConnectionContext {
+            transport_connection_id: context.transport_connection_id,
+            connection_id: context.connection_id,
+            peer: context.peer,
+            route: context.route,
+            cf_ray: context.cf_ray,
+            downstream_http_version: context.downstream_http_version,
+            active_connection,
+            observability,
+        },
+        downstream,
+        backend,
+        shutdown,
+        max_message_size,
+    )
+    .await;
+}
+
 async fn connect_backend(
     route: &Route,
     executor: &TrackedExecutor,
     metadata: &BackendHandshakeMetadata,
     headers: &BackendHandshakeHeaders,
 ) -> Result<BackendConnection> {
+    match route.backend().kind() {
+        BackendKind::WebSocket => {
+            connect_websocket_backend(route, executor, metadata, headers).await
+        }
+        BackendKind::Tcp => connect_tcp_backend(route).await,
+    }
+}
+
+async fn connect_tcp_backend(route: &Route) -> Result<BackendConnection> {
     let stream = TcpStream::connect(route.backend().address()).await.with_context(|| {
         format!(
-            "failed to connect to WebSocket backend {}",
+            "failed to connect to TCP backend {}",
             route.backend().display()
+        )
+    })?;
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for TCP backend")?;
+    Ok(BackendConnection::Tcp { stream })
+}
+
+async fn connect_websocket_backend(
+    route: &Route,
+    executor: &TrackedExecutor,
+    metadata: &BackendHandshakeMetadata,
+    headers: &BackendHandshakeHeaders,
+) -> Result<BackendConnection> {
+    let endpoint = route
+        .backend()
+        .websocket()
+        .context("WebSocket route resolved without a WebSocket backend endpoint")?;
+    let stream = TcpStream::connect(endpoint.address()).await.with_context(|| {
+        format!(
+            "failed to connect to WebSocket backend {}",
+            endpoint.display()
         )
     })?;
     stream
@@ -396,8 +518,8 @@ async fn connect_backend(
 
     let mut request = Request::builder()
         .method(Method::GET)
-        .uri(route.backend().request_target().clone())
-        .header(HOST, route.backend().host_header().clone())
+        .uri(endpoint.request_target().clone())
+        .header(HOST, endpoint.host_header().clone())
         .header(UPGRADE, "websocket")
         .header(CONNECTION, "upgrade")
         .header("Sec-WebSocket-Key", handshake::generate_key())
@@ -436,7 +558,7 @@ async fn connect_backend(
         .context("WebSocket backend handshake failed")?;
     let selected_subprotocol =
         validate_backend_subprotocol(response.headers(), &headers.websocket_protocols)?;
-    Ok(BackendConnection {
+    Ok(BackendConnection::WebSocket {
         websocket,
         selected_subprotocol,
     })
@@ -565,9 +687,26 @@ impl BackendHandshakeHeaders {
     }
 }
 
-struct BackendConnection {
-    websocket: GatewayWebSocket,
-    selected_subprotocol: Option<HeaderValue>,
+enum BackendConnection {
+    WebSocket {
+        websocket: GatewayWebSocket,
+        selected_subprotocol: Option<HeaderValue>,
+    },
+    Tcp {
+        stream: TcpStream,
+    },
+}
+
+impl BackendConnection {
+    fn selected_subprotocol(&self) -> Option<&HeaderValue> {
+        match self {
+            Self::WebSocket {
+                selected_subprotocol,
+                ..
+            } => selected_subprotocol.as_ref(),
+            Self::Tcp { .. } => None,
+        }
+    }
 }
 
 struct RelayLaunchContext {

@@ -55,10 +55,19 @@ diagnostic_interval_seconds = 60
 diagnostic_file = "observability-runtime-diagnostic.jsonl"
 connection_event_logs_enabled = true
 
+# [[routes]] is the WebSocket ingress table. Backend transport is selected by URI:
+#   ws://...  -> terminate downstream WSS/WS and proxy to a WebSocket backend
+#   tcp://... -> terminate downstream WSS/WS and stream payload bytes to raw TCP
 # Custom absolute paths are allowed. Paths outside /api/pc|mob|uat emit a warning only.
 [[routes]]
+id = "route-z"
+path = "/custom-ws1"
+backend = "tcp://127.0.0.1:33301"
+enabled = true
+
+[[routes]]
 id = "route-a"
-path = "/custom-ws"
+path = "/custom-ws2"
 backend = "ws://127.0.0.1:10002/app1"
 enabled = true
 
@@ -70,6 +79,6 @@ enabled = true
 
 [[grpc_routes]]
 id = "grpc-tun"
-path = "/edge.Gateway/Tun"
+path = "/xzy/Tun"
 backend = "h2c://127.0.0.1:50051"
 enabled = true

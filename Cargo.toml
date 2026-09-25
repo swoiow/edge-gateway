@@ -1,6 +1,6 @@
 [package]
 name = "edge-gateway"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 publish = false
 description = "Cloudflare-facing Rust edge gateway for WebSocket/gRPC backend"

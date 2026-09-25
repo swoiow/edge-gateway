@@ -9,7 +9,8 @@ use fastwebsockets::{
 };
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{interval_at, timeout};
@@ -57,6 +58,7 @@ impl RelaySocket {
 }
 
 const CLOSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const TCP_BRIDGE_READ_BUFFER_BYTES: usize = 64 * 1024;
 const SHORT_LIVED_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 const LONG_LIVED_CONNECTION_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
@@ -258,6 +260,320 @@ pub(super) async fn run(
         &client_snapshot,
         &backend_snapshot,
     );
+}
+
+pub(super) async fn run_tcp_backend(
+    context: ConnectionContext,
+    mut downstream: RelaySocket,
+    backend: TcpStream,
+    shutdown: CancellationToken,
+    max_message_size: usize,
+) {
+    let started = Instant::now();
+    let sdk_message_limit = max_message_size.saturating_add(1);
+    downstream.read.set_max_message_size(sdk_message_limit);
+
+    let downstream_write = Arc::new(Mutex::new(downstream.write));
+    let (backend_read, backend_write) = backend.into_split();
+
+    if !context.observability.connection_event_logs_enabled() {
+        debug!(
+            transport_connection_id = context.transport_connection_id,
+            connection_id = context.connection_id,
+            route_id = context.route.id(),
+            route_class = context.route.namespace().as_str(),
+            route_path = context.route.path(),
+            backend = context.route.backend().display(),
+            backend_transport = "tcp",
+            peer = %context.peer,
+            cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
+            downstream_http_version = context.downstream_http_version,
+            active_websocket_connections = context.active_connection.active_connections(),
+            "websocket-to-tcp relay started"
+        );
+    }
+
+    let runtime_observation_enabled = context.observability.mode() != ObservabilityMode::Off;
+    let detailed_observation = context.observability.mode() == ObservabilityMode::Diagnostic
+        || context.observability.connection_event_logs_enabled();
+    let client_to_backend = Arc::new(DirectionDiagnostics::new(
+        Instant::now(),
+        runtime_observation_enabled || detailed_observation,
+        detailed_observation,
+    ));
+    let backend_to_client = Arc::new(DirectionDiagnostics::new(
+        Instant::now(),
+        runtime_observation_enabled || detailed_observation,
+        detailed_observation,
+    ));
+
+    let relay_cancellation = CancellationToken::new();
+    let mut pumps = JoinSet::new();
+    pumps.spawn(pump_websocket_to_tcp(
+        downstream.read,
+        Arc::clone(&downstream_write),
+        backend_write,
+        relay_cancellation.child_token(),
+        Arc::clone(&client_to_backend),
+        context.observability.clone(),
+    ));
+    pumps.spawn(pump_tcp_to_websocket(
+        backend_read,
+        Arc::clone(&downstream_write),
+        relay_cancellation.child_token(),
+        Arc::clone(&backend_to_client),
+        context.observability.clone(),
+    ));
+
+    let observation_interval =
+        Duration::from_secs(context.observability.observation_interval_seconds().max(1));
+    let mut observation_tick = interval_at(
+        tokio::time::Instant::now() + observation_interval,
+        observation_interval,
+    );
+    let mut progress = ProgressTracker::default();
+    let mut reports = Vec::with_capacity(2);
+
+    let close_reason = loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break CloseReason::GatewayShutdown,
+            result = pumps.join_next() => {
+                break match result {
+                    Some(Ok(report)) => {
+                        let reason = report.close_reason();
+                        reports.push(report);
+                        reason
+                    }
+                    Some(Err(error)) => {
+                        warn!(
+                            transport_connection_id = context.transport_connection_id,
+                            connection_id = context.connection_id,
+                            route_id = context.route.id(),
+                            route_class = context.route.namespace().as_str(),
+                            error = %error,
+                            "websocket-to-tcp relay task terminated unexpectedly"
+                        );
+                        CloseReason::InternalError
+                    }
+                    None => CloseReason::InternalError,
+                };
+            }
+            _ = observation_tick.tick(), if runtime_observation_enabled => {
+                observe_progress(
+                    &context,
+                    &client_to_backend,
+                    &backend_to_client,
+                    started,
+                    observation_interval,
+                    &mut progress,
+                );
+            }
+        }
+    };
+
+    relay_cancellation.cancel();
+    while let Some(result) = pumps.join_next().await {
+        match result {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                warn!(
+                    transport_connection_id = context.transport_connection_id,
+                    connection_id = context.connection_id,
+                    route_id = context.route.id(),
+                    route_class = context.route.namespace().as_str(),
+                    error = %error,
+                    "websocket-to-tcp relay task terminated unexpectedly"
+                );
+            }
+        }
+    }
+
+    let (code, reason) = match close_reason {
+        CloseReason::ClientClosed | CloseReason::BackendClosed => (1000, b"".as_slice()),
+        CloseReason::GatewayShutdown => (1001, b"gateway shutdown".as_slice()),
+        CloseReason::RelayError | CloseReason::InternalError => {
+            (1011, b"gateway relay error".as_slice())
+        }
+    };
+    best_effort_close(&downstream_write, code, reason).await;
+
+    for report in &reports {
+        if let PumpEnd::Error(error) = &report.end {
+            warn!(
+                transport_connection_id = context.transport_connection_id,
+                connection_id = context.connection_id,
+                route_id = context.route.id(),
+                route_class = context.route.namespace().as_str(),
+                direction = report.direction.as_str(),
+                failed_stage = report.final_snapshot.stage.as_str(),
+                %error,
+                "websocket-to-tcp relay direction ended with an error"
+            );
+        }
+    }
+
+    let first_error = reports.iter().find(|report| matches!(&report.end, PumpEnd::Error(_)));
+    let first_error_direction = first_error.map(|report| report.direction.as_str()).unwrap_or("-");
+    let first_error_stage =
+        first_error.map(|report| report.final_snapshot.stage.as_str()).unwrap_or("-");
+    let client_snapshot = client_to_backend.snapshot();
+    let backend_snapshot = backend_to_client.snapshot();
+    let duration = started.elapsed();
+    let duration_ms = duration.as_millis();
+    context.observability.record_websocket_closed(
+        close_reason.observability_class(),
+        duration >= LONG_LIVED_CONNECTION_THRESHOLD,
+        duration <= SHORT_LIVED_CONNECTION_THRESHOLD,
+    );
+    let remaining_active = context.active_connection.active_connections().saturating_sub(1);
+
+    log_closed(
+        &context,
+        close_reason,
+        duration_ms,
+        remaining_active,
+        first_error_direction,
+        first_error_stage,
+        &client_snapshot,
+        &backend_snapshot,
+    );
+}
+
+async fn pump_websocket_to_tcp(
+    mut reader: GatewaySocketRead,
+    own_writer: SharedWriter,
+    mut backend_write: tokio::net::tcp::OwnedWriteHalf,
+    cancellation: CancellationToken,
+    diagnostics: Arc<DirectionDiagnostics>,
+    observability: RuntimeObservability,
+) -> PumpReport {
+    let direction = Direction::ClientToBackend;
+    loop {
+        diagnostics.set_stage(RelayStage::AwaitingRead);
+        let control_writer = Arc::clone(&own_writer);
+        let control_cancellation = cancellation.child_token();
+        let control_diagnostics = Arc::clone(&diagnostics);
+        let control_observability = observability.clone();
+        let mut send_control = move |frame: Frame<'_>| {
+            let opcode = frame.opcode;
+            let fin = frame.fin;
+            // Control payloads are RFC 6455 bounded to 125 bytes. Owning them here
+            // keeps the async callback independent from the parser's input buffer.
+            let payload: Vec<u8> = frame.payload.into();
+            let frame: Frame<'static> = Frame::new(fin, opcode, None, payload.into());
+            let writer = Arc::clone(&control_writer);
+            let cancellation = control_cancellation.child_token();
+            let diagnostics = Arc::clone(&control_diagnostics);
+            let observability = control_observability.clone();
+            async move {
+                diagnostics.record_control_frame(opcode, fin, frame.payload.len());
+                observability.record_control_frame(direction.observability_direction());
+                tokio::select! {
+                    () = cancellation.cancelled() => Err(WebSocketError::ConnectionClosed),
+                    result = write_frame_and_flush(
+                        &writer,
+                        frame,
+                        &diagnostics,
+                        RelayStage::WritingControlFrame,
+                    ) => result,
+                }
+            }
+        };
+
+        let frame = tokio::select! {
+            () = cancellation.cancelled() => {
+                return PumpReport::cancelled(direction, &diagnostics);
+            }
+            result = reader.read_frame(&mut send_control) => {
+                match result {
+                    Ok(frame) => frame,
+                    Err(error) => return PumpReport::error(direction, &diagnostics, error),
+                }
+            }
+        };
+
+        match frame.opcode {
+            // A TCP backend has byte-stream semantics, so WebSocket message and
+            // fragment boundaries intentionally disappear at this boundary.
+            OpCode::Text | OpCode::Binary | OpCode::Continuation => {
+                let payload_bytes = frame.payload.len();
+                diagnostics.record_read(frame.opcode, frame.fin, payload_bytes);
+                diagnostics.set_stage(RelayStage::WritingStreamBytes);
+                let write_result = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return PumpReport::cancelled(direction, &diagnostics);
+                    }
+                    result = backend_write.write_all(&frame.payload[..]) => result,
+                };
+                if let Err(error) = write_result {
+                    return PumpReport::error(direction, &diagnostics, error);
+                }
+                diagnostics.record_forwarded(payload_bytes);
+                observability
+                    .record_forwarded_frame(direction.observability_direction(), payload_bytes);
+            }
+            OpCode::Close => {
+                diagnostics.record_control_frame(frame.opcode, frame.fin, frame.payload.len());
+                observability.record_control_frame(direction.observability_direction());
+                let _result = timeout(CLOSE_WRITE_TIMEOUT, backend_write.shutdown()).await;
+                return PumpReport::peer_closed(direction, &diagnostics);
+            }
+            OpCode::Ping | OpCode::Pong => {
+                diagnostics.record_control_frame(frame.opcode, frame.fin, frame.payload.len());
+                observability.record_control_frame(direction.observability_direction());
+            }
+        }
+    }
+}
+
+async fn pump_tcp_to_websocket(
+    mut backend_read: tokio::net::tcp::OwnedReadHalf,
+    downstream_writer: SharedWriter,
+    cancellation: CancellationToken,
+    diagnostics: Arc<DirectionDiagnostics>,
+    observability: RuntimeObservability,
+) -> PumpReport {
+    let direction = Direction::BackendToClient;
+    // One bounded allocation per connection, then reuse it for the lifetime of
+    // the tunnel. This avoids hot-loop allocation while keeping backpressure in
+    // the socket/write futures instead of an unbounded application queue.
+    let mut buffer = vec![0_u8; TCP_BRIDGE_READ_BUFFER_BYTES];
+
+    loop {
+        diagnostics.set_stage(RelayStage::AwaitingRead);
+        let read = tokio::select! {
+            () = cancellation.cancelled() => {
+                return PumpReport::cancelled(direction, &diagnostics);
+            }
+            result = backend_read.read(&mut buffer) => result,
+        };
+        let payload_bytes = match read {
+            Ok(0) => return PumpReport::peer_closed(direction, &diagnostics),
+            Ok(read) => read,
+            Err(error) => return PumpReport::error(direction, &diagnostics, error),
+        };
+
+        diagnostics.record_read(OpCode::Binary, true, payload_bytes);
+        let frame = Frame::new(
+            true,
+            OpCode::Binary,
+            None,
+            (&buffer[..payload_bytes]).into(),
+        );
+        if let Err(error) = forward_frame(
+            &downstream_writer,
+            frame,
+            &diagnostics,
+            RelayStage::WritingDataFrame,
+            &cancellation,
+        )
+        .await
+        {
+            return PumpReport::error(direction, &diagnostics, error);
+        }
+        diagnostics.record_forwarded(payload_bytes);
+        observability.record_forwarded_frame(direction.observability_direction(), payload_bytes);
+    }
 }
 
 async fn pump(
@@ -633,7 +949,7 @@ impl PumpReport {
     fn error(
         direction: Direction,
         diagnostics: &DirectionDiagnostics,
-        error: WebSocketError,
+        error: impl ToString,
     ) -> Self {
         Self {
             direction,
@@ -696,10 +1012,11 @@ enum RelayStage {
     WaitingWriterLock = 1,
     WritingDataFrame = 2,
     WritingControlFrame = 3,
-    FlushingFrame = 4,
-    PeerClosed = 5,
-    Cancelled = 6,
-    Ended = 7,
+    WritingStreamBytes = 4,
+    FlushingFrame = 5,
+    PeerClosed = 6,
+    Cancelled = 7,
+    Ended = 8,
 }
 
 impl RelayStage {
@@ -709,9 +1026,10 @@ impl RelayStage {
             1 => Self::WaitingWriterLock,
             2 => Self::WritingDataFrame,
             3 => Self::WritingControlFrame,
-            4 => Self::FlushingFrame,
-            5 => Self::PeerClosed,
-            6 => Self::Cancelled,
+            4 => Self::WritingStreamBytes,
+            5 => Self::FlushingFrame,
+            6 => Self::PeerClosed,
+            7 => Self::Cancelled,
             _ => Self::Ended,
         }
     }
@@ -722,6 +1040,7 @@ impl RelayStage {
             Self::WaitingWriterLock => "waiting_writer_lock",
             Self::WritingDataFrame => "writing_data_frame",
             Self::WritingControlFrame => "writing_control_frame",
+            Self::WritingStreamBytes => "writing_stream_bytes",
             Self::FlushingFrame => "flushing_frame",
             Self::PeerClosed => "peer_closed",
             Self::Cancelled => "cancelled",
@@ -739,14 +1058,15 @@ impl RelayStage {
             Self::WaitingWriterLock
                 | Self::WritingDataFrame
                 | Self::WritingControlFrame
+                | Self::WritingStreamBytes
                 | Self::FlushingFrame
         )
     }
 }
 
-// FragmentCollectorRead exposes a complete data message as the frame forwarded by
-// the gateway. These sizes therefore describe forwarded frames after fragment
-// collection, not the original on-wire fragment boundaries.
+// For WS→WS, FragmentCollectorRead exposes complete data messages after fragment
+// collection. For WS→TCP, the raw reader records individual data frames/chunks
+// because message boundaries intentionally disappear at the byte-stream boundary.
 struct DirectionDiagnostics {
     started: Instant,
     enabled: bool,
