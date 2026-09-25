@@ -1,8 +1,10 @@
+mod acme;
 mod config;
 mod gateway;
 mod grpc;
 mod observability;
 mod routes;
+mod tls;
 
 use std::ffi::OsString;
 use std::path::PathBuf;

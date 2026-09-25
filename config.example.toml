@@ -7,9 +7,33 @@ shutdown_grace_seconds = 120
 max_websocket_message_size_bytes = 1048576
 max_grpc_concurrent_streams_per_backend = 256
 
+# Certificate pairs are discovered by id:
+#   certs/gateway.fullchain.pem + certs/gateway.key.pem
+#   certs/service-a.fullchain.pem + certs/service-a.key.pem
+# SNI names are read from each certificate's DNS SANs, not from the filename.
 [tls]
-cert = "certs/fullchain.pem"
-key = "certs/privkey.pem"
+cert_dir = "certs"
+cert_suffix = ".fullchain.pem"
+key_suffix = ".key.pem"
+default_certificate = "gateway"
+
+# Built-in ACME is optional. When disabled, certificates can be managed manually
+# or by an external ACME/DNS-01 client and are still served through the same
+# multi-certificate store.
+[acme]
+enabled = false
+http01_listen = "0.0.0.0:80"
+environment = "production" # use "staging" while testing ACME integration
+state_dir = "state/acme"
+fallback_renew_before_days = 30
+check_interval_hours = 12
+# email = "admin@example.com"
+
+# Uncomment together with acme.enabled = true and acme.email.
+# Wildcards are intentionally unsupported here because HTTP-01 cannot issue them.
+# [[acme.certificates]]
+# id = "gateway"
+# domains = ["gateway.example.com", "api.example.com"]
 
 [observability]
 mode = "production"

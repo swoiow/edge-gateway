@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,8 @@ const DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 30;
 const DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND: usize = 256;
+const DEFAULT_ACME_FALLBACK_RENEW_BEFORE_DAYS: u64 = 30;
+const DEFAULT_ACME_CHECK_INTERVAL_HOURS: u64 = 12;
 
 const MAX_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 300;
 const MAX_WEBSOCKET_UPGRADE_TIMEOUT_SECONDS: u64 = 300;
@@ -23,10 +26,13 @@ const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 600;
 const MAX_WEBSOCKET_MESSAGE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND: usize = 4096;
 const MAX_OBSERVABILITY_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_ACME_FALLBACK_RENEW_BEFORE_DAYS: u64 = 90;
+const MAX_ACME_CHECK_INTERVAL_HOURS: u64 = 7 * 24;
 
 pub(crate) struct Config {
     server: ServerConfig,
     tls: TlsConfig,
+    acme: AcmeConfig,
     observability: ObservabilityConfig,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
@@ -53,6 +59,7 @@ impl Config {
     ) -> (
         ServerConfig,
         TlsConfig,
+        AcmeConfig,
         ObservabilityConfig,
         Arc<RouteTable>,
         Arc<GrpcRouteTable>,
@@ -60,6 +67,7 @@ impl Config {
         (
             self.server,
             self.tls,
+            self.acme,
             self.observability,
             self.routes,
             self.grpc_routes,
@@ -107,18 +115,124 @@ impl ServerConfig {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct TlsConfig {
-    cert: PathBuf,
-    key: PathBuf,
+    cert_dir: PathBuf,
+    cert_suffix: String,
+    key_suffix: String,
+    default_certificate: Option<String>,
 }
 
 impl TlsConfig {
-    pub(crate) fn cert(&self) -> &Path {
-        &self.cert
+    pub(crate) fn cert_dir(&self) -> &Path {
+        &self.cert_dir
     }
 
-    pub(crate) fn key(&self) -> &Path {
-        &self.key
+    pub(crate) fn cert_suffix(&self) -> &str {
+        &self.cert_suffix
+    }
+
+    pub(crate) fn key_suffix(&self) -> &str {
+        &self.key_suffix
+    }
+
+    pub(crate) fn default_certificate(&self) -> Option<&str> {
+        self.default_certificate.as_deref()
+    }
+
+    pub(crate) fn cert_path(&self, id: &str) -> PathBuf {
+        self.cert_dir.join(format!("{id}{}", self.cert_suffix))
+    }
+
+    pub(crate) fn key_path(&self, id: &str) -> PathBuf {
+        self.cert_dir.join(format!("{id}{}", self.key_suffix))
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcmeEnvironment {
+    Production,
+    Staging,
+}
+
+#[derive(Clone)]
+pub(crate) struct AcmeCertificateConfig {
+    id: String,
+    domains: Vec<String>,
+}
+
+impl AcmeCertificateConfig {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn domains(&self) -> &[String] {
+        &self.domains
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AcmeConfig {
+    enabled: bool,
+    http01_listen: SocketAddr,
+    email: Option<String>,
+    environment: AcmeEnvironment,
+    state_dir: PathBuf,
+    fallback_renew_before: Duration,
+    check_interval: Duration,
+    certificates: Vec<AcmeCertificateConfig>,
+}
+
+impl AcmeConfig {
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn http01_listen(&self) -> SocketAddr {
+        self.http01_listen
+    }
+
+    pub(crate) fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    pub(crate) fn environment(&self) -> AcmeEnvironment {
+        self.environment
+    }
+
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub(crate) fn fallback_renew_before(&self) -> Duration {
+        self.fallback_renew_before
+    }
+
+    pub(crate) fn check_interval(&self) -> Duration {
+        self.check_interval
+    }
+
+    pub(crate) fn certificates(&self) -> &[AcmeCertificateConfig] {
+        &self.certificates
+    }
+
+    pub(crate) fn manages_certificate(&self, id: &str) -> bool {
+        self.certificates.iter().any(|certificate| certificate.id() == id)
+    }
+
+    fn disabled(config_directory: &Path) -> Self {
+        Self {
+            enabled: false,
+            http01_listen: default_acme_http01_listen(),
+            email: None,
+            environment: AcmeEnvironment::Production,
+            state_dir: resolve_config_path(config_directory, PathBuf::from("state/acme")),
+            fallback_renew_before: Duration::from_secs(
+                DEFAULT_ACME_FALLBACK_RENEW_BEFORE_DAYS * 24 * 60 * 60,
+            ),
+            check_interval: Duration::from_secs(DEFAULT_ACME_CHECK_INTERVAL_HOURS * 60 * 60),
+            certificates: Vec::new(),
+        }
     }
 }
 
@@ -181,6 +295,8 @@ struct FileConfig {
     server: FileServerConfig,
     tls: FileTlsConfig,
     #[serde(default)]
+    acme: Option<FileAcmeConfig>,
+    #[serde(default)]
     observability: Option<FileObservabilityConfig>,
     #[serde(default)]
     routes: Vec<FileRouteConfig>,
@@ -221,8 +337,12 @@ impl FileConfig {
             MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND,
         )?;
 
-        validate_path("tls.cert", &self.tls.cert)?;
-        validate_path("tls.key", &self.tls.key)?;
+        let tls = self.tls.validate(config_directory)?;
+        let acme = self
+            .acme
+            .map(|config| config.validate(config_directory))
+            .transpose()?
+            .unwrap_or_else(|| AcmeConfig::disabled(config_directory));
 
         let observability = self
             .observability
@@ -264,10 +384,8 @@ impl FileConfig {
                 max_websocket_message_size,
                 max_grpc_concurrent_streams_per_backend,
             },
-            tls: TlsConfig {
-                cert: self.tls.cert,
-                key: self.tls.key,
-            },
+            tls,
+            acme,
             observability,
             routes,
             grpc_routes,
@@ -296,8 +414,188 @@ struct FileServerConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileTlsConfig {
-    cert: PathBuf,
-    key: PathBuf,
+    cert_dir: PathBuf,
+    #[serde(default = "default_tls_cert_suffix")]
+    cert_suffix: String,
+    #[serde(default = "default_tls_key_suffix")]
+    key_suffix: String,
+    #[serde(default)]
+    default_certificate: Option<String>,
+}
+
+impl FileTlsConfig {
+    fn validate(self, config_directory: &Path) -> Result<TlsConfig, ConfigError> {
+        validate_path("tls.cert_dir", &self.cert_dir)?;
+        validate_suffix("tls.cert_suffix", &self.cert_suffix)?;
+        validate_suffix("tls.key_suffix", &self.key_suffix)?;
+        if self.cert_suffix == self.key_suffix
+            || self.cert_suffix.ends_with(&self.key_suffix)
+            || self.key_suffix.ends_with(&self.cert_suffix)
+        {
+            return Err(ConfigError::Invalid(
+                "tls.cert_suffix and tls.key_suffix must be distinct and non-overlapping"
+                    .to_owned(),
+            ));
+        }
+        if let Some(id) = self.default_certificate.as_deref() {
+            validate_certificate_id("tls.default_certificate", id)?;
+        }
+
+        Ok(TlsConfig {
+            cert_dir: resolve_config_path(config_directory, self.cert_dir),
+            cert_suffix: self.cert_suffix,
+            key_suffix: self.key_suffix,
+            default_certificate: self.default_certificate,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileAcmeConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_acme_http01_listen")]
+    http01_listen: SocketAddr,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    environment: FileAcmeEnvironment,
+    #[serde(default = "default_acme_state_dir")]
+    state_dir: PathBuf,
+    #[serde(default = "default_acme_fallback_renew_before_days")]
+    fallback_renew_before_days: u64,
+    #[serde(default = "default_acme_check_interval_hours")]
+    check_interval_hours: u64,
+    #[serde(default)]
+    certificates: Vec<FileAcmeCertificateConfig>,
+}
+
+impl FileAcmeConfig {
+    fn validate(self, config_directory: &Path) -> Result<AcmeConfig, ConfigError> {
+        validate_path("acme.state_dir", &self.state_dir)?;
+
+        if self.fallback_renew_before_days == 0
+            || self.fallback_renew_before_days > MAX_ACME_FALLBACK_RENEW_BEFORE_DAYS
+        {
+            return Err(ConfigError::Invalid(format!(
+                "acme.fallback_renew_before_days must be between 1 and {MAX_ACME_FALLBACK_RENEW_BEFORE_DAYS}"
+            )));
+        }
+        if self.check_interval_hours == 0
+            || self.check_interval_hours > MAX_ACME_CHECK_INTERVAL_HOURS
+        {
+            return Err(ConfigError::Invalid(format!(
+                "acme.check_interval_hours must be between 1 and {MAX_ACME_CHECK_INTERVAL_HOURS}"
+            )));
+        }
+
+        let email = self
+            .email
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if self.enabled && email.is_none() {
+            return Err(ConfigError::Invalid(
+                "acme.email is required when ACME is enabled".to_owned(),
+            ));
+        }
+        if let Some(value) = email.as_deref() {
+            if value.contains(char::is_whitespace) || !value.contains('@') {
+                return Err(ConfigError::Invalid(
+                    "acme.email must be a plain email address".to_owned(),
+                ));
+            }
+        }
+        if self.enabled && self.certificates.is_empty() {
+            return Err(ConfigError::Invalid(
+                "acme.certificates must contain at least one managed certificate when ACME is enabled"
+                    .to_owned(),
+            ));
+        }
+
+        let mut certificate_ids = HashSet::new();
+        let mut managed_domains = HashSet::new();
+        let mut certificates = Vec::with_capacity(self.certificates.len());
+        for (index, certificate) in self.certificates.into_iter().enumerate() {
+            let id_field = format!("acme.certificates[{index}].id");
+            validate_certificate_id(&id_field, &certificate.id)?;
+            if !certificate_ids.insert(certificate.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate ACME certificate id {:?}",
+                    certificate.id
+                )));
+            }
+            if certificate.domains.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "acme.certificates[{index}].domains must not be empty"
+                )));
+            }
+
+            let mut local_domains = HashSet::new();
+            let mut domains = Vec::with_capacity(certificate.domains.len());
+            for domain in certificate.domains {
+                let domain = normalize_domain(&domain).map_err(|reason| {
+                    ConfigError::Invalid(format!(
+                        "invalid acme.certificates[{index}] domain {domain:?}: {reason}"
+                    ))
+                })?;
+                if !local_domains.insert(domain.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate domain {domain:?} in ACME certificate {:?}",
+                        certificate.id
+                    )));
+                }
+                if !managed_domains.insert(domain.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "ACME domain {domain:?} is assigned to more than one certificate"
+                    )));
+                }
+                domains.push(domain);
+            }
+            domains.sort();
+            certificates.push(AcmeCertificateConfig {
+                id: certificate.id,
+                domains,
+            });
+        }
+
+        Ok(AcmeConfig {
+            enabled: self.enabled,
+            http01_listen: self.http01_listen,
+            email,
+            environment: self.environment.into(),
+            state_dir: resolve_config_path(config_directory, self.state_dir),
+            fallback_renew_before: Duration::from_secs(
+                self.fallback_renew_before_days * 24 * 60 * 60,
+            ),
+            check_interval: Duration::from_secs(self.check_interval_hours * 60 * 60),
+            certificates,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FileAcmeEnvironment {
+    #[default]
+    Production,
+    Staging,
+}
+
+impl From<FileAcmeEnvironment> for AcmeEnvironment {
+    fn from(value: FileAcmeEnvironment) -> Self {
+        match value {
+            FileAcmeEnvironment::Production => Self::Production,
+            FileAcmeEnvironment::Staging => Self::Staging,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileAcmeCertificateConfig {
+    id: String,
+    domains: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -446,12 +744,67 @@ fn validate_count(field: &'static str, value: usize, maximum: usize) -> Result<u
     Ok(value)
 }
 
-fn validate_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
+fn validate_path(field: &str, path: &Path) -> Result<(), ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::Invalid(format!("{field} must not be empty")));
     }
 
     Ok(())
+}
+
+fn validate_suffix(field: &str, suffix: &str) -> Result<(), ConfigError> {
+    if suffix.is_empty() {
+        return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+    }
+    if suffix.contains('/') || suffix.contains('\\') {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must be a filename suffix, not a path"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_certificate_id(field: &str, id: &str) -> Result<(), ConfigError> {
+    if id.is_empty() {
+        return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+    }
+    if !id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{field} may contain only ASCII letters, digits, '.', '-' and '_'"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_domain(domain: &str) -> Result<String, &'static str> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err("domain must not be empty");
+    }
+    if domain.starts_with("*.") {
+        return Err("wildcard domains require DNS-01 and are not supported by built-in HTTP-01");
+    }
+    if domain.len() > 253 || !domain.is_ascii() {
+        return Err("domain must be an ASCII DNS name no longer than 253 characters");
+    }
+    if domain.parse::<IpAddr>().is_ok() {
+        return Err("IP identifiers are not supported by built-in ACME");
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("DNS labels must contain between 1 and 63 characters");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("DNS labels must not start or end with '-'");
+        }
+        if !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            return Err("DNS labels may contain only ASCII letters, digits and '-'");
+        }
+    }
+    Ok(domain)
 }
 
 fn resolve_config_path(config_directory: &Path, path: PathBuf) -> PathBuf {
@@ -486,6 +839,59 @@ const fn default_max_grpc_concurrent_streams_per_backend() -> usize {
     DEFAULT_MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND
 }
 
+fn default_tls_cert_suffix() -> String {
+    ".fullchain.pem".to_owned()
+}
+
+fn default_tls_key_suffix() -> String {
+    ".key.pem".to_owned()
+}
+
+fn default_acme_http01_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 80))
+}
+
+fn default_acme_state_dir() -> PathBuf {
+    PathBuf::from("state/acme")
+}
+
+const fn default_acme_fallback_renew_before_days() -> u64 {
+    DEFAULT_ACME_FALLBACK_RENEW_BEFORE_DAYS
+}
+
+const fn default_acme_check_interval_hours() -> u64 {
+    DEFAULT_ACME_CHECK_INTERVAL_HOURS
+}
+
 const fn default_route_enabled() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{FileTlsConfig, normalize_domain};
+
+    #[test]
+    fn acme_domain_normalization_rejects_wildcards() {
+        assert!(normalize_domain("*.example.com").is_err());
+        assert!(normalize_domain("192.0.2.10").is_err());
+        assert_eq!(
+            normalize_domain("API.Example.COM."),
+            Ok("api.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn tls_suffixes_must_not_overlap() {
+        let result = FileTlsConfig {
+            cert_dir: PathBuf::from("certs"),
+            cert_suffix: ".pem".to_owned(),
+            key_suffix: ".key.pem".to_owned(),
+            default_certificate: None,
+        }
+        .validate(Path::new("."));
+        assert!(result.is_err());
+    }
 }

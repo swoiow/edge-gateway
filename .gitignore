@@ -3,6 +3,10 @@
 
 sdk/*
 
+# edge-gateway local TLS/ACME secrets
+state/acme/
+*.key.pem
+
 # --- Source: https://raw.githubusercontent.com/github/gitignore/main/Python.gitignore ---
 # Byte-compiled / optimized / DLL files
 __pycache__/

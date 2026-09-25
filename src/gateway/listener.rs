@@ -1,11 +1,10 @@
 use std::convert::Infallible;
 use std::future::Future;
-use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -14,7 +13,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnectionBuilder;
-use rustls::ServerConfig as RustlsServerConfig;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -22,16 +20,19 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::{ObservabilityConfig, ServerConfig, TlsConfig};
+use crate::acme::{AcmeManager, AcmeRuntime};
+use crate::config::{AcmeConfig, ObservabilityConfig, ServerConfig, TlsConfig};
 use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::websocket::WebSocketRuntime;
 use crate::grpc::{GrpcRouteTable, GrpcRuntime};
 use crate::observability::{ActiveConnection, RuntimeObservability};
 use crate::routes::RouteTable;
+use crate::tls::{CertificateStore, build_acceptor};
 
 pub(super) async fn run<F>(
     server_config: ServerConfig,
     tls_config: TlsConfig,
+    acme_config: AcmeConfig,
     observability_config: ObservabilityConfig,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
@@ -40,7 +41,40 @@ pub(super) async fn run<F>(
 where
     F: Future<Output = ()>,
 {
-    let tls_acceptor = build_tls_acceptor(&tls_config).await?;
+    let certificate_store = CertificateStore::load(tls_config.clone()).await?;
+    let mut acme_manager = if acme_config.enabled() {
+        Some(AcmeManager::new(
+            acme_config.clone(),
+            tls_config,
+            certificate_store.clone(),
+        ))
+    } else {
+        None
+    };
+    if let Some(manager) = acme_manager.as_mut() {
+        manager.bootstrap_if_store_empty().await?;
+    }
+    if certificate_store.is_empty() {
+        bail!(
+            "TLS certificate directory contains no usable certificate pairs and ACME did not provision one"
+        );
+    }
+    if !certificate_store.default_certificate_available() {
+        let pending_managed_default = certificate_store
+            .config()
+            .default_certificate()
+            .is_some_and(|id| acme_config.enabled() && acme_config.manages_certificate(id));
+        if pending_managed_default {
+            warn!(
+                default_certificate = ?certificate_store.config().default_certificate(),
+                "configured default TLS certificate is pending ACME issuance; existing SNI certificates remain available"
+            );
+        } else {
+            bail!("tls.default_certificate does not identify a loaded certificate");
+        }
+    }
+
+    let tls_acceptor = build_acceptor(&certificate_store);
     let listener = TcpListener::bind(server_config.listen())
         .await
         .with_context(|| format!("failed to bind listener on {}", server_config.listen()))?;
@@ -68,6 +102,9 @@ where
         websocket: websocket_runtime.clone(),
         grpc: grpc_runtime.clone(),
     };
+    let acme_runtime = acme_manager
+        .take()
+        .map(|manager| AcmeRuntime::start(manager, cancellation.child_token()));
 
     info!(
         listen = %server_config.listen(),
@@ -75,6 +112,8 @@ where
         enabled_websocket_routes = routes.enabled_count(),
         configured_grpc_routes = grpc_runtime.configured_route_count(),
         enabled_grpc_routes = grpc_runtime.enabled_route_count(),
+        tls_certificates = certificate_store.certificate_count(),
+        acme_enabled = acme_config.enabled(),
         "gateway listener started"
     );
 
@@ -143,6 +182,10 @@ where
         );
     }
 
+    if let Some(runtime) = acme_runtime {
+        runtime.wait().await;
+    }
+
     observability_shutdown.cancel();
     observability_task.wait().await;
     info!("gateway shutdown complete");
@@ -166,37 +209,6 @@ struct ConnectionParameters {
     active_connection: ActiveConnection,
     state: ServiceState,
     observability: RuntimeObservability,
-}
-
-async fn build_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
-    let certificate_bytes = tokio::fs::read(config.cert())
-        .await
-        .with_context(|| format!("failed to read TLS certificate {}", config.cert().display()))?;
-    let key_bytes = tokio::fs::read(config.key())
-        .await
-        .with_context(|| format!("failed to read TLS private key {}", config.key().display()))?;
-
-    let mut certificate_reader = BufReader::new(certificate_bytes.as_slice());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to parse TLS certificate chain")?;
-
-    if certificates.is_empty() {
-        return Err(anyhow!("TLS certificate file contains no certificates"));
-    }
-
-    let mut key_reader = BufReader::new(key_bytes.as_slice());
-    let private_key = rustls_pemfile::private_key(&mut key_reader)
-        .context("failed to parse TLS private key")?
-        .ok_or_else(|| anyhow!("TLS private key file contains no supported private key"))?;
-
-    let mut tls_config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .context("TLS certificate and private key are incompatible")?;
-    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
 async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
@@ -242,19 +254,16 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
     };
     observability.record_tls_handshake_success();
 
-    let (_, tls_connection) = tls_stream.get_ref();
-
-    let alpn = tls_connection
+    let alpn = tls_stream
+        .get_ref()
+        .1
         .alpn_protocol()
         .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
         .unwrap_or_else(|| "none".to_owned());
-
     if observability.connection_event_logs_enabled() {
-        let sni = tls_connection.server_name().map(|name| name.to_owned());
         info!(
             transport_connection_id,
             %peer,
-            ?sni,
             %alpn,
             handshake_duration_ms = handshake_started.elapsed().as_millis(),
             active_transport_connections = active_connection.active_connections(),
