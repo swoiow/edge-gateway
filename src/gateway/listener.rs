@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::acme::{AcmeManager, AcmeRuntime};
-use crate::config::{AcmeConfig, ObservabilityConfig, ServerConfig, TlsConfig};
+use crate::config::{AcmeConfig, FallbackConfig, ObservabilityConfig, ServerConfig, TlsConfig};
+use crate::fallback::FallbackRuntime;
 use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::websocket::WebSocketRuntime;
 use crate::grpc::{GrpcRouteTable, GrpcRuntime};
@@ -34,6 +35,7 @@ pub(super) async fn run<F>(
     tls_config: TlsConfig,
     acme_config: AcmeConfig,
     observability_config: ObservabilityConfig,
+    fallback_config: Option<FallbackConfig>,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
     shutdown_signal: F,
@@ -97,10 +99,22 @@ where
         cancellation.child_token(),
         observability.clone(),
     );
+    let fallback_runtime = match fallback_config {
+        Some(config) => Some(
+            FallbackRuntime::new(
+                config,
+                server_config.backend_connect_timeout(),
+                cancellation.child_token(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let service_state = ServiceState {
         routes: Arc::clone(&routes),
         websocket: websocket_runtime.clone(),
         grpc: grpc_runtime.clone(),
+        fallback: fallback_runtime.clone(),
     };
     let acme_runtime = acme_manager
         .take()
@@ -114,6 +128,7 @@ where
         enabled_grpc_routes = grpc_runtime.enabled_route_count(),
         tls_certificates = certificate_store.certificate_count(),
         acme_enabled = acme_config.enabled(),
+        fallback_enabled = fallback_runtime.is_some(),
         "gateway listener started"
     );
 
@@ -165,6 +180,9 @@ where
     cancellation.cancel();
     websocket_runtime.close();
     grpc_runtime.close();
+    if let Some(runtime) = &fallback_runtime {
+        runtime.close();
+    }
 
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
@@ -173,7 +191,12 @@ where
     }
 
     let data_plane_shutdown = async {
-        tokio::join!(websocket_runtime.wait(), grpc_runtime.wait());
+        let fallback_wait = async {
+            if let Some(runtime) = &fallback_runtime {
+                runtime.wait().await;
+            }
+        };
+        tokio::join!(websocket_runtime.wait(), grpc_runtime.wait(), fallback_wait);
     };
     if timeout(server_config.shutdown_grace(), data_plane_shutdown).await.is_err() {
         warn!(
@@ -197,6 +220,7 @@ struct ServiceState {
     routes: Arc<RouteTable>,
     websocket: WebSocketRuntime,
     grpc: GrpcRuntime,
+    fallback: Option<FallbackRuntime>,
 }
 
 struct ConnectionParameters {
@@ -254,6 +278,7 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
     };
     observability.record_tls_handshake_success();
 
+    let downstream_sni = tls_stream.get_ref().1.server_name().map(str::to_owned);
     let alpn = tls_stream
         .get_ref()
         .1
@@ -282,9 +307,16 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
 
     let request_count = Arc::new(AtomicU64::new(0));
     let service_request_count = Arc::clone(&request_count);
+    let service_downstream_sni = downstream_sni.clone();
     let service = service_fn(move |request| {
         service_request_count.fetch_add(1, Ordering::Relaxed);
-        handle_request(request, state.clone(), peer, transport_connection_id)
+        handle_request(
+            request,
+            state.clone(),
+            peer,
+            transport_connection_id,
+            service_downstream_sni.clone(),
+        )
     });
     let io = TokioIo::new(tls_stream);
     let mut builder = AutoConnectionBuilder::new(TokioExecutor::new());
@@ -368,6 +400,7 @@ async fn handle_request(
     state: ServiceState,
     peer: std::net::SocketAddr,
     transport_connection_id: u64,
+    downstream_sni: Option<String>,
 ) -> std::result::Result<Response<ResponseBody>, Infallible> {
     if request.method() == Method::GET
         && matches!(request.uri().path(), "/health/live" | "/health/ready")
@@ -416,6 +449,17 @@ async fn handle_request(
 
     if let Some(route) = state.grpc.resolve(path) {
         return Ok(state.grpc.proxy(request, route, peer, transport_connection_id).await);
+    }
+
+    if let Some(fallback) = &state.fallback {
+        return Ok(fallback
+            .proxy(
+                request,
+                peer,
+                transport_connection_id,
+                downstream_sni.as_deref(),
+            )
+            .await);
     }
 
     debug!(

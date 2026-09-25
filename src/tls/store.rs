@@ -42,8 +42,8 @@ pub(super) struct CertificateIndex {
 }
 
 impl CertificateIndex {
-    pub(super) fn exact_certificate(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        self.exact.get(name).cloned()
+    pub(super) fn exact_certificates(&self) -> &HashMap<String, Arc<CertifiedKey>> {
+        &self.exact
     }
 
     pub(super) fn wildcard_certificates(&self) -> &HashMap<String, Arc<CertifiedKey>> {
@@ -52,6 +52,10 @@ impl CertificateIndex {
 
     pub(super) fn default_certificate(&self) -> Option<Arc<CertifiedKey>> {
         self.default.clone()
+    }
+
+    pub(super) fn default_certificate_ref(&self) -> Option<&Arc<CertifiedKey>> {
+        self.default.as_ref()
     }
 }
 

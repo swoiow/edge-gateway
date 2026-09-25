@@ -5,6 +5,7 @@ use std::sync::Arc;
 use hyper::Uri;
 use hyper::header::HeaderValue;
 use thiserror::Error;
+use tracing::warn;
 
 const MAX_ROUTE_ID_LENGTH: usize = 128;
 const MAX_ROUTE_PATH_LENGTH: usize = 2048;
@@ -34,6 +35,13 @@ impl RouteTable {
         for spec in specs {
             validate_id(&spec.id)?;
             let namespace = validate_public_path(&spec.path)?;
+            if namespace == RouteNamespace::Custom {
+                warn!(
+                    route_id = %spec.id,
+                    path = %spec.path,
+                    "WebSocket route uses a custom path outside /api/pc/, /api/mob/, and /api/uat/"
+                );
+            }
 
             if !ids.insert(spec.id.clone()) {
                 return Err(RouteError::DuplicateId(spec.id));
@@ -103,6 +111,7 @@ pub(crate) enum RouteNamespace {
     Pc,
     Mobile,
     Uat,
+    Custom,
 }
 
 impl RouteNamespace {
@@ -111,6 +120,7 @@ impl RouteNamespace {
             Self::Pc => "pc",
             Self::Mobile => "mob",
             Self::Uat => "uat",
+            Self::Custom => "custom",
         }
     }
 }
@@ -215,7 +225,7 @@ pub(crate) enum RouteError {
     #[error("route id {0:?} contains control or whitespace characters")]
     InvalidId(String),
     #[error(
-        "route path {0:?} must be an exact non-empty route below /api/pc/, /api/mob/, or /api/uat/"
+        "route path {0:?} must be an exact absolute path without empty/dot segments, query, fragment, backslash, whitespace, or control characters"
     )]
     InvalidPath(String),
     #[error("route path {0:?} exceeds {MAX_ROUTE_PATH_LENGTH} bytes")]
@@ -246,27 +256,62 @@ fn validate_public_path(path: &str) -> Result<RouteNamespace, RouteError> {
     if path.len() > MAX_ROUTE_PATH_LENGTH {
         return Err(RouteError::PathTooLong(path.to_owned()));
     }
-
-    let (namespace, suffix) = if let Some(suffix) = path.strip_prefix(PC_ROUTE_PREFIX) {
-        (RouteNamespace::Pc, suffix)
-    } else if let Some(suffix) = path.strip_prefix(MOBILE_ROUTE_PREFIX) {
-        (RouteNamespace::Mobile, suffix)
-    } else if let Some(suffix) = path.strip_prefix(UAT_ROUTE_PREFIX) {
-        (RouteNamespace::Uat, suffix)
-    } else {
-        return Err(RouteError::InvalidPath(path.to_owned()));
-    };
-
-    let has_invalid_segment = suffix
-        .split('/')
-        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."));
-    let has_invalid_character = path.contains(['?', '#', '\\'])
+    if !path.starts_with('/')
+        || path.contains(['?', '#', '\\'])
         || path.chars().any(char::is_whitespace)
-        || path.chars().any(char::is_control);
-
-    if has_invalid_segment || has_invalid_character {
+        || path.chars().any(char::is_control)
+    {
         return Err(RouteError::InvalidPath(path.to_owned()));
     }
 
+    if path != "/"
+        && path[1..]
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(RouteError::InvalidPath(path.to_owned()));
+    }
+
+    let namespace = if path.starts_with(PC_ROUTE_PREFIX) {
+        RouteNamespace::Pc
+    } else if path.starts_with(MOBILE_ROUTE_PREFIX) {
+        RouteNamespace::Mobile
+    } else if path.starts_with(UAT_ROUTE_PREFIX) {
+        RouteNamespace::Uat
+    } else {
+        RouteNamespace::Custom
+    };
+
     Ok(namespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RouteNamespace, validate_public_path};
+
+    #[test]
+    fn custom_absolute_paths_are_allowed() {
+        assert!(matches!(
+            validate_public_path("/hsin_tiao"),
+            Ok(RouteNamespace::Custom)
+        ));
+        assert!(matches!(
+            validate_public_path("/api/wechat-ws"),
+            Ok(RouteNamespace::Custom)
+        ));
+        assert!(matches!(
+            validate_public_path("/api/pc/socket"),
+            Ok(RouteNamespace::Pc)
+        ));
+    }
+
+    #[test]
+    fn unsafe_or_ambiguous_paths_remain_rejected() {
+        for path in ["relative", "/a//b", "/a/../b", "/a/./b", "/a?x=1", "/a#frag", "/a\\b"] {
+            assert!(
+                validate_public_path(path).is_err(),
+                "{path:?} should be rejected"
+            );
+        }
+    }
 }

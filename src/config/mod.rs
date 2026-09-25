@@ -34,6 +34,7 @@ pub(crate) struct Config {
     tls: TlsConfig,
     acme: AcmeConfig,
     observability: ObservabilityConfig,
+    fallback: Option<FallbackConfig>,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
 }
@@ -61,6 +62,7 @@ impl Config {
         TlsConfig,
         AcmeConfig,
         ObservabilityConfig,
+        Option<FallbackConfig>,
         Arc<RouteTable>,
         Arc<GrpcRouteTable>,
     ) {
@@ -69,6 +71,7 @@ impl Config {
             self.tls,
             self.acme,
             self.observability,
+            self.fallback,
             self.routes,
             self.grpc_routes,
         )
@@ -112,6 +115,54 @@ impl ServerConfig {
 
     pub(crate) fn max_grpc_concurrent_streams_per_backend(&self) -> usize {
         self.max_grpc_concurrent_streams_per_backend
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FallbackScheme {
+    Http,
+    Https,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FallbackTlsServerName {
+    RequestHost,
+    Literal(String),
+}
+
+#[derive(Clone)]
+pub(crate) struct FallbackConfig {
+    backend: String,
+    scheme: FallbackScheme,
+    address: SocketAddr,
+    preserve_host: bool,
+    tls_server_name: FallbackTlsServerName,
+    ca_file: Option<PathBuf>,
+}
+
+impl FallbackConfig {
+    pub(crate) fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    pub(crate) const fn scheme(&self) -> FallbackScheme {
+        self.scheme
+    }
+
+    pub(crate) const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    pub(crate) const fn preserve_host(&self) -> bool {
+        self.preserve_host
+    }
+
+    pub(crate) fn tls_server_name(&self) -> &FallbackTlsServerName {
+        &self.tls_server_name
+    }
+
+    pub(crate) fn ca_file(&self) -> Option<&Path> {
+        self.ca_file.as_deref()
     }
 }
 
@@ -299,6 +350,8 @@ struct FileConfig {
     #[serde(default)]
     observability: Option<FileObservabilityConfig>,
     #[serde(default)]
+    fallback: Option<FileFallbackConfig>,
+    #[serde(default)]
     routes: Vec<FileRouteConfig>,
     #[serde(default)]
     grpc_routes: Vec<FileGrpcRouteConfig>,
@@ -350,6 +403,12 @@ impl FileConfig {
             .transpose()?
             .unwrap_or_else(ObservabilityConfig::off);
 
+        let fallback = self
+            .fallback
+            .map(|config| config.validate(config_directory))
+            .transpose()?
+            .flatten();
+
         let route_specs = self
             .routes
             .into_iter()
@@ -387,6 +446,7 @@ impl FileConfig {
             tls,
             acme,
             observability,
+            fallback,
             routes,
             grpc_routes,
         })
@@ -655,6 +715,104 @@ impl From<FileObservabilityMode> for ObservabilityMode {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FileFallbackConfig {
+    #[serde(default)]
+    enabled: bool,
+    backend: String,
+    #[serde(default = "default_fallback_preserve_host")]
+    preserve_host: bool,
+    #[serde(default = "default_fallback_tls_server_name")]
+    tls_server_name: String,
+    #[serde(default)]
+    ca_file: Option<PathBuf>,
+}
+
+impl FileFallbackConfig {
+    fn validate(self, config_directory: &Path) -> Result<Option<FallbackConfig>, ConfigError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+
+        let uri = self.backend.parse::<hyper::Uri>().map_err(|source| {
+            ConfigError::Invalid(format!(
+                "invalid fallback.backend {:?}: {source}",
+                self.backend
+            ))
+        })?;
+        let scheme = match uri.scheme_str() {
+            Some("http") => FallbackScheme::Http,
+            Some("https") => FallbackScheme::Https,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "fallback.backend scheme must be http or https".to_owned(),
+                ));
+            }
+        };
+        let authority = uri.authority().ok_or_else(|| {
+            ConfigError::Invalid("fallback.backend authority is required".to_owned())
+        })?;
+        if authority.as_str().contains('@') {
+            return Err(ConfigError::Invalid(
+                "fallback.backend userinfo is not allowed".to_owned(),
+            ));
+        }
+        let host = uri
+            .host()
+            .ok_or_else(|| ConfigError::Invalid("fallback.backend host is required".to_owned()))?;
+        let ip = host.parse::<IpAddr>().map_err(|_| {
+            ConfigError::Invalid(
+                "fallback.backend host must be an IPv4 or IPv6 loopback address".to_owned(),
+            )
+        })?;
+        if !ip.is_loopback() {
+            return Err(ConfigError::Invalid(
+                "fallback.backend host must be a loopback address".to_owned(),
+            ));
+        }
+        let port = uri.port_u16().ok_or_else(|| {
+            ConfigError::Invalid("fallback.backend must include an explicit port".to_owned())
+        })?;
+        if uri.path_and_query().map(|value| value.as_str()).unwrap_or("/") != "/" {
+            return Err(ConfigError::Invalid(
+                "fallback.backend must not contain a path or query".to_owned(),
+            ));
+        }
+
+        let tls_server_name = if self.tls_server_name == "request_host" {
+            FallbackTlsServerName::RequestHost
+        } else {
+            let name = normalize_tls_server_name(&self.tls_server_name).map_err(|reason| {
+                ConfigError::Invalid(format!(
+                    "invalid fallback.tls_server_name {:?}: {reason}",
+                    self.tls_server_name
+                ))
+            })?;
+            FallbackTlsServerName::Literal(name)
+        };
+
+        if let Some(path) = self.ca_file.as_deref() {
+            validate_path("fallback.ca_file", path)?;
+        }
+        let ca_file = self.ca_file.map(|path| resolve_config_path(config_directory, path));
+        if scheme == FallbackScheme::Http && ca_file.is_some() {
+            return Err(ConfigError::Invalid(
+                "fallback.ca_file is only valid for an https backend".to_owned(),
+            ));
+        }
+
+        Ok(Some(FallbackConfig {
+            backend: self.backend,
+            scheme,
+            address: SocketAddr::new(ip, port),
+            preserve_host: self.preserve_host,
+            tls_server_name,
+            ca_file,
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileRouteConfig {
     id: String,
     path: String,
@@ -807,6 +965,31 @@ fn normalize_domain(domain: &str) -> Result<String, &'static str> {
     Ok(domain)
 }
 
+fn normalize_tls_server_name(name: &str) -> Result<String, &'static str> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return Err("name must not be empty");
+    }
+    if name.len() > 253 || !name.is_ascii() {
+        return Err("name must be an ASCII DNS name no longer than 253 characters");
+    }
+    if name.parse::<IpAddr>().is_ok() {
+        return Err("an IP address is not valid for TLS server-name verification");
+    }
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("DNS labels must contain between 1 and 63 characters");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("DNS labels must not start or end with '-'");
+        }
+        if !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+            return Err("DNS labels may contain only ASCII letters, digits and '-'");
+        }
+    }
+    Ok(name)
+}
+
 fn resolve_config_path(config_directory: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -863,6 +1046,14 @@ const fn default_acme_check_interval_hours() -> u64 {
     DEFAULT_ACME_CHECK_INTERVAL_HOURS
 }
 
+const fn default_fallback_preserve_host() -> bool {
+    true
+}
+
+fn default_fallback_tls_server_name() -> String {
+    "request_host".to_owned()
+}
+
 const fn default_route_enabled() -> bool {
     true
 }
@@ -871,7 +1062,9 @@ const fn default_route_enabled() -> bool {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{FileTlsConfig, normalize_domain};
+    use super::{
+        FallbackScheme, FallbackTlsServerName, FileFallbackConfig, FileTlsConfig, normalize_domain,
+    };
 
     #[test]
     fn acme_domain_normalization_rejects_wildcards() {
@@ -881,6 +1074,41 @@ mod tests {
             normalize_domain("API.Example.COM."),
             Ok("api.example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn fallback_https_loopback_preserves_request_host_by_default() {
+        let result = FileFallbackConfig {
+            enabled: true,
+            backend: "https://127.0.0.1:9443".to_owned(),
+            preserve_host: true,
+            tls_server_name: "request_host".to_owned(),
+            ca_file: None,
+        }
+        .validate(Path::new("."));
+
+        assert!(matches!(&result, Ok(Some(_))));
+        if let Ok(Some(config)) = result {
+            assert_eq!(config.scheme(), FallbackScheme::Https);
+            assert!(config.preserve_host());
+            assert_eq!(
+                config.tls_server_name(),
+                &FallbackTlsServerName::RequestHost
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_requires_loopback_backend() {
+        let result = FileFallbackConfig {
+            enabled: true,
+            backend: "https://192.0.2.10:9443".to_owned(),
+            preserve_host: true,
+            tls_server_name: "request_host".to_owned(),
+            ca_file: None,
+        }
+        .validate(Path::new("."));
+        assert!(result.is_err());
     }
 
     #[test]

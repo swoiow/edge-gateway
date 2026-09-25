@@ -35,6 +35,18 @@ check_interval_hours = 12
 # id = "gateway"
 # domains = ["gateway.example.com", "api.example.com"]
 
+
+# Optional legacy fallback. Explicit edge WebSocket/gRPC routes always win;
+# only unmatched requests are forwarded here. For an existing TLS-enabled
+# Nginx, move its public listener to loopback (for example 127.0.0.1:9443).
+# Host is preserved and TLS SNI defaults to the original downstream SNI/Host.
+[fallback]
+enabled = false
+backend = "https://127.0.0.1:9443"
+preserve_host = true
+tls_server_name = "request_host"
+# ca_file = "certs/cloudflare-origin-ca.pem" # only needed for a private/origin CA
+
 [observability]
 mode = "production"
 summary_interval_seconds = 300
@@ -43,16 +55,17 @@ diagnostic_interval_seconds = 60
 diagnostic_file = "observability-runtime-diagnostic.jsonl"
 connection_event_logs_enabled = true
 
+# Custom absolute paths are allowed. Paths outside /api/pc|mob|uat emit a warning only.
 [[routes]]
 id = "route-a"
-path = "/api/pc/a"
-backend = "ws://127.0.0.1:10002/v2fly"
+path = "/custom-ws"
+backend = "ws://127.0.0.1:10002/app1"
 enabled = true
 
 [[routes]]
 id = "develop"
 path = "/api/uat/health"
-backend = "ws://127.0.0.1:10002/v2fly"
+backend = "ws://127.0.0.1:10002/app2"
 enabled = true
 
 [[grpc_routes]]

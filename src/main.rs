@@ -1,5 +1,6 @@
 mod acme;
 mod config;
+mod fallback;
 mod gateway;
 mod grpc;
 mod observability;

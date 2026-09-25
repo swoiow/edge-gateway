@@ -14,12 +14,13 @@ pub(crate) async fn run<F>(config: Config, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()>,
 {
-    let (server, tls, acme, observability, routes, grpc_routes) = config.into_parts();
+    let (server, tls, acme, observability, fallback, routes, grpc_routes) = config.into_parts();
     listener::run(
         server,
         tls,
         acme,
         observability,
+        fallback,
         routes,
         grpc_routes,
         shutdown,
