@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 
 use crate::grpc::{GrpcRouteError, GrpcRouteSpec, GrpcRouteTable};
 use crate::routes::{RouteError, RouteSpec, RouteTable};
+use crate::routing::{RoutingPolicy, normalize_dns_host};
+use crate::security::{ClientAddressPolicy, ClientIpMode, IpNetwork};
 
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_WEBSOCKET_UPGRADE_TIMEOUT_SECONDS: u64 = 10;
@@ -31,6 +34,8 @@ const MAX_ACME_CHECK_INTERVAL_HOURS: u64 = 7 * 24;
 
 pub(crate) struct Config {
     server: ServerConfig,
+    routing: Arc<RoutingPolicy>,
+    client_address: Arc<ClientAddressPolicy>,
     tls: TlsConfig,
     acme: AcmeConfig,
     observability: ObservabilityConfig,
@@ -52,13 +57,15 @@ impl Config {
                 source,
             })?;
         let config_directory = path.parent().unwrap_or_else(|| Path::new("."));
-        file_config.validate(config_directory)
+        file_config.validate(config_directory).await
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
         ServerConfig,
+        Arc<RoutingPolicy>,
+        Arc<ClientAddressPolicy>,
         TlsConfig,
         AcmeConfig,
         ObservabilityConfig,
@@ -68,6 +75,8 @@ impl Config {
     ) {
         (
             self.server,
+            self.routing,
+            self.client_address,
             self.tls,
             self.acme,
             self.observability,
@@ -86,9 +95,49 @@ pub(crate) struct ServerConfig {
     shutdown_grace: Duration,
     max_websocket_message_size: usize,
     max_grpc_concurrent_streams_per_backend: usize,
+    max_connections: usize,
+    max_concurrent_tls_handshakes: usize,
+    max_active_requests: usize,
+    max_http_header_count: usize,
+    max_http_header_bytes: usize,
+    max_http2_concurrent_streams: usize,
+    max_http2_send_buffer_bytes: usize,
+    http_header_read_timeout: Duration,
 }
 
 impl ServerConfig {
+    pub(crate) fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    pub(crate) fn max_concurrent_tls_handshakes(&self) -> usize {
+        self.max_concurrent_tls_handshakes
+    }
+
+    pub(crate) fn max_active_requests(&self) -> usize {
+        self.max_active_requests
+    }
+
+    pub(crate) fn max_http_header_count(&self) -> usize {
+        self.max_http_header_count
+    }
+
+    pub(crate) fn max_http_header_bytes(&self) -> usize {
+        self.max_http_header_bytes
+    }
+
+    pub(crate) fn max_http2_concurrent_streams(&self) -> usize {
+        self.max_http2_concurrent_streams
+    }
+
+    pub(crate) fn max_http2_send_buffer_bytes(&self) -> usize {
+        self.max_http2_send_buffer_bytes
+    }
+
+    pub(crate) fn http_header_read_timeout(&self) -> Duration {
+        self.http_header_read_timeout
+    }
+
     pub(crate) fn listen(&self) -> SocketAddr {
         self.listen
     }
@@ -133,6 +182,7 @@ pub(crate) enum FallbackTlsServerName {
 #[derive(Clone)]
 pub(crate) struct FallbackConfig {
     backend: String,
+    hosts: HashSet<String>,
     scheme: FallbackScheme,
     address: SocketAddr,
     preserve_host: bool,
@@ -141,6 +191,14 @@ pub(crate) struct FallbackConfig {
 }
 
 impl FallbackConfig {
+    pub(crate) fn permits_host(&self, host: &str) -> bool {
+        self.hosts.contains(host)
+    }
+
+    pub(crate) fn hosts(&self) -> impl Iterator<Item = &String> {
+        self.hosts.iter()
+    }
+
     pub(crate) fn backend(&self) -> &str {
         &self.backend
     }
@@ -301,6 +359,7 @@ pub(crate) struct ObservabilityConfig {
     diagnostic_interval: Duration,
     diagnostic_file: PathBuf,
     connection_event_logs_enabled: bool,
+    detailed_frame_observation_enabled: bool,
 }
 
 impl ObservabilityConfig {
@@ -324,6 +383,10 @@ impl ObservabilityConfig {
         &self.diagnostic_file
     }
 
+    pub(crate) fn detailed_frame_observation_enabled(&self) -> bool {
+        self.detailed_frame_observation_enabled
+    }
+
     pub(crate) fn connection_event_logs_enabled(&self) -> bool {
         self.connection_event_logs_enabled
     }
@@ -336,6 +399,7 @@ impl ObservabilityConfig {
             diagnostic_interval: Duration::from_secs(60),
             diagnostic_file: PathBuf::new(),
             connection_event_logs_enabled: false,
+            detailed_frame_observation_enabled: false,
         }
     }
 }
@@ -343,6 +407,9 @@ impl ObservabilityConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    client_ip: FileClientIpConfig,
+    #[serde(default)]
+    routing: FileRoutingConfig,
     server: FileServerConfig,
     tls: FileTlsConfig,
     #[serde(default)]
@@ -358,7 +425,7 @@ struct FileConfig {
 }
 
 impl FileConfig {
-    fn validate(self, config_directory: &Path) -> Result<Config, ConfigError> {
+    async fn validate(self, config_directory: &Path) -> Result<Config, ConfigError> {
         let tls_handshake_timeout = validate_seconds(
             "server.tls_handshake_timeout_seconds",
             self.server.tls_handshake_timeout_seconds,
@@ -390,6 +457,58 @@ impl FileConfig {
             MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND,
         )?;
 
+        let client_address = Arc::new(self.client_ip.validate(config_directory).await?);
+        let max_connections = validate_count(
+            "server.max_connections",
+            self.server.max_connections,
+            1000000,
+        )?;
+        let max_concurrent_tls_handshakes = validate_count(
+            "server.max_concurrent_tls_handshakes",
+            self.server.max_concurrent_tls_handshakes,
+            65536,
+        )?;
+        let max_active_requests = validate_count(
+            "server.max_active_requests",
+            self.server.max_active_requests,
+            1000000,
+        )?;
+        let max_http_header_count = validate_count(
+            "server.max_http_header_count",
+            self.server.max_http_header_count,
+            1024,
+        )?;
+        let max_http_header_bytes = validate_count(
+            "server.max_http_header_bytes",
+            self.server.max_http_header_bytes,
+            1048576,
+        )?;
+        let max_http2_concurrent_streams = validate_count(
+            "server.max_http2_concurrent_streams",
+            self.server.max_http2_concurrent_streams,
+            65536,
+        )?;
+        let max_http2_send_buffer_bytes = validate_count(
+            "server.max_http2_send_buffer_bytes",
+            self.server.max_http2_send_buffer_bytes,
+            1048576,
+        )?;
+        let http_header_read_timeout = validate_seconds(
+            "server.http_header_read_timeout_seconds",
+            self.server.http_header_read_timeout_seconds,
+            300,
+        )?;
+        if max_http_header_bytes < 8192 {
+            return Err(ConfigError::Invalid(
+                "server.max_http_header_bytes must be at least 8192".to_owned(),
+            ));
+        }
+        if max_concurrent_tls_handshakes > max_connections {
+            return Err(ConfigError::Invalid(
+                "TLS handshake capacity must not exceed max_connections".to_owned(),
+            ));
+        }
+
         let tls = self.tls.validate(config_directory)?;
         let acme = self
             .acme
@@ -409,29 +528,67 @@ impl FileConfig {
             .transpose()?
             .flatten();
 
-        let route_specs = self
+        let route_specs: Vec<RouteSpec> = self
             .routes
             .into_iter()
             .map(|route| RouteSpec {
                 id: route.id,
+                host: route.host,
                 path: route.path,
                 backend: route.backend,
                 enabled: route.enabled,
             })
             .collect();
+        let mut hosts = HashSet::new();
+        let mut websocket_paths = HashSet::new();
+        for route in &route_specs {
+            if matches!(route.path.as_str(), "/health/live" | "/health/ready") {
+                return Err(ConfigError::Invalid(
+                    "WebSocket routes must not use reserved health paths".to_owned(),
+                ));
+            }
+            let host = normalize_dns_host(&route.host)
+                .map_err(|reason| ConfigError::Invalid(format!("routes.host: {reason}")))?;
+            websocket_paths.insert((host.clone(), route.path.clone()));
+            if route.enabled {
+                hosts.insert(host);
+            }
+        }
         let routes = Arc::new(RouteTable::build(route_specs)?);
 
-        let grpc_route_specs = self
+        let grpc_route_specs: Vec<GrpcRouteSpec> = self
             .grpc_routes
             .into_iter()
             .map(|route| GrpcRouteSpec {
                 id: route.id,
+                host: route.host,
                 path: route.path,
                 backend: route.backend,
                 enabled: route.enabled,
             })
             .collect();
+        for route in &grpc_route_specs {
+            let host = normalize_dns_host(&route.host)
+                .map_err(|reason| ConfigError::Invalid(format!("grpc_routes.host: {reason}")))?;
+            if websocket_paths.contains(&(host.clone(), route.path.clone())) {
+                return Err(ConfigError::Invalid(format!(
+                    "WS and gRPC conflict at {host}{}",
+                    route.path
+                )));
+            }
+            if route.enabled {
+                hosts.insert(host);
+            }
+        }
         let grpc_routes = Arc::new(GrpcRouteTable::build(grpc_route_specs)?);
+        if let Some(fallback) = &fallback {
+            hosts.extend(fallback.hosts().cloned());
+        }
+        let bindings = self.routing.sni_bindings.into_iter().map(|b| (b.sni, b.hosts)).collect();
+        let routing = Arc::new(
+            RoutingPolicy::build(hosts, self.routing.require_sni, bindings)
+                .map_err(ConfigError::Invalid)?,
+        );
 
         Ok(Config {
             server: ServerConfig {
@@ -442,7 +599,17 @@ impl FileConfig {
                 shutdown_grace,
                 max_websocket_message_size,
                 max_grpc_concurrent_streams_per_backend,
+                max_connections,
+                max_concurrent_tls_handshakes,
+                max_active_requests,
+                max_http_header_count,
+                max_http_header_bytes,
+                max_http2_concurrent_streams,
+                max_http2_send_buffer_bytes,
+                http_header_read_timeout,
             },
+            routing,
+            client_address,
             tls,
             acme,
             observability,
@@ -469,6 +636,22 @@ struct FileServerConfig {
     max_websocket_message_size_bytes: usize,
     #[serde(default = "default_max_grpc_concurrent_streams_per_backend")]
     max_grpc_concurrent_streams_per_backend: usize,
+    #[serde(default = "default_max_connections")]
+    max_connections: usize,
+    #[serde(default = "default_max_concurrent_tls_handshakes")]
+    max_concurrent_tls_handshakes: usize,
+    #[serde(default = "default_max_active_requests")]
+    max_active_requests: usize,
+    #[serde(default = "default_max_http_header_count")]
+    max_http_header_count: usize,
+    #[serde(default = "default_max_http_header_bytes")]
+    max_http_header_bytes: usize,
+    #[serde(default = "default_max_http2_concurrent_streams")]
+    max_http2_concurrent_streams: usize,
+    #[serde(default = "default_max_http2_send_buffer_bytes")]
+    max_http2_send_buffer_bytes: usize,
+    #[serde(default = "default_http_header_read_timeout_seconds")]
+    http_header_read_timeout_seconds: u64,
 }
 
 #[derive(Deserialize)]
@@ -667,6 +850,8 @@ struct FileObservabilityConfig {
     diagnostic_interval_seconds: u64,
     diagnostic_file: PathBuf,
     connection_event_logs_enabled: bool,
+    #[serde(default)]
+    detailed_frame_observation_enabled: bool,
 }
 
 impl FileObservabilityConfig {
@@ -691,6 +876,7 @@ impl FileObservabilityConfig {
             diagnostic_interval,
             diagnostic_file: resolve_config_path(config_directory, self.diagnostic_file),
             connection_event_logs_enabled: self.connection_event_logs_enabled,
+            detailed_frame_observation_enabled: self.detailed_frame_observation_enabled,
         })
     }
 }
@@ -716,6 +902,7 @@ impl From<FileObservabilityMode> for ObservabilityMode {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileFallbackConfig {
+    hosts: Vec<String>,
     #[serde(default)]
     enabled: bool,
     backend: String,
@@ -733,6 +920,21 @@ impl FileFallbackConfig {
             return Ok(None);
         }
 
+        if self.hosts.is_empty() {
+            return Err(ConfigError::Invalid(
+                "fallback.hosts must not be empty".to_owned(),
+            ));
+        }
+        let mut hosts = HashSet::new();
+        for host in self.hosts {
+            let host = normalize_dns_host(&host)
+                .map_err(|reason| ConfigError::Invalid(format!("fallback.hosts: {reason}")))?;
+            if !hosts.insert(host.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate fallback host {host}"
+                )));
+            }
+        }
         let uri = self.backend.parse::<hyper::Uri>().map_err(|source| {
             ConfigError::Invalid(format!(
                 "invalid fallback.backend {:?}: {source}",
@@ -802,6 +1004,7 @@ impl FileFallbackConfig {
 
         Ok(Some(FallbackConfig {
             backend: self.backend,
+            hosts,
             scheme,
             address: SocketAddr::new(ip, port),
             preserve_host: self.preserve_host,
@@ -815,6 +1018,7 @@ impl FileFallbackConfig {
 #[serde(deny_unknown_fields)]
 struct FileRouteConfig {
     id: String,
+    host: String,
     path: String,
     backend: String,
     #[serde(default = "default_route_enabled")]
@@ -825,6 +1029,7 @@ struct FileRouteConfig {
 #[serde(deny_unknown_fields)]
 struct FileGrpcRouteConfig {
     id: String,
+    host: String,
     path: String,
     backend: String,
     #[serde(default = "default_route_enabled")]
@@ -1080,6 +1285,7 @@ mod tests {
     fn fallback_https_loopback_preserves_request_host_by_default() {
         let result = FileFallbackConfig {
             enabled: true,
+            hosts: vec!["api.example.com".to_owned()],
             backend: "https://127.0.0.1:9443".to_owned(),
             preserve_host: true,
             tls_server_name: "request_host".to_owned(),
@@ -1102,6 +1308,7 @@ mod tests {
     fn fallback_requires_loopback_backend() {
         let result = FileFallbackConfig {
             enabled: true,
+            hosts: vec!["api.example.com".to_owned()],
             backend: "https://192.0.2.10:9443".to_owned(),
             preserve_host: true,
             tls_server_name: "request_host".to_owned(),
@@ -1121,5 +1328,157 @@ mod tests {
         }
         .validate(Path::new("."));
         assert!(result.is_err());
+    }
+}
+
+const fn default_max_connections() -> usize {
+    20000
+}
+
+const fn default_max_concurrent_tls_handshakes() -> usize {
+    512
+}
+
+const fn default_max_active_requests() -> usize {
+    20000
+}
+
+const fn default_max_http_header_count() -> usize {
+    100
+}
+
+const fn default_max_http_header_bytes() -> usize {
+    32768
+}
+
+const fn default_max_http2_concurrent_streams() -> usize {
+    256
+}
+
+const fn default_max_http2_send_buffer_bytes() -> usize {
+    65536
+}
+
+const fn default_http_header_read_timeout_seconds() -> u64 {
+    10
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRoutingConfig {
+    #[serde(default = "default_require_sni")]
+    require_sni: bool,
+    #[serde(default)]
+    sni_bindings: Vec<FileSniBinding>,
+}
+impl Default for FileRoutingConfig {
+    fn default() -> Self {
+        Self {
+            require_sni: true,
+            sni_bindings: Vec::new(),
+        }
+    }
+}
+const fn default_require_sni() -> bool {
+    true
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSniBinding {
+    sni: String,
+    hosts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileClientIpConfig {
+    mode: ClientIpMode,
+    #[serde(default)]
+    trusted_proxy_cidrs_file: Option<PathBuf>,
+    #[serde(default = "default_health_peer_cidrs")]
+    health_peer_cidrs: Vec<String>,
+}
+fn default_health_peer_cidrs() -> Vec<String> {
+    vec!["127.0.0.0/8".to_owned(), "::1/128".to_owned()]
+}
+impl FileClientIpConfig {
+    async fn validate(self, directory: &Path) -> Result<ClientAddressPolicy, ConfigError> {
+        if self.health_peer_cidrs.len() > 128 {
+            return Err(ConfigError::Invalid(
+                "client_ip.health_peer_cidrs exceeds 128 entries".to_owned(),
+            ));
+        }
+        let health = self
+            .health_peer_cidrs
+            .iter()
+            .map(|value| {
+                IpNetwork::parse(value).map_err(|reason| {
+                    ConfigError::Invalid(format!("client_ip.health_peer_cidrs {value:?}: {reason}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut trusted = Vec::new();
+        match (self.mode, self.trusted_proxy_cidrs_file) {
+            (ClientIpMode::Cloudflare, Some(path)) => {
+                validate_path("client_ip.trusted_proxy_cidrs_file", &path)?;
+                let path = resolve_config_path(directory, path);
+                let file =
+                    tokio::fs::File::open(&path).await.map_err(|source| ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let mut data = String::new();
+                file.take(262145).read_to_string(&mut data).await.map_err(|source| {
+                    ConfigError::Read {
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
+                if data.len() > 262144 {
+                    return Err(ConfigError::Invalid(
+                        "trusted proxy CIDR file exceeds 256 KiB".to_owned(),
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for (line, value) in data.lines().enumerate() {
+                    let value = value.split('#').next().unwrap_or("").trim();
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if !seen.insert(value.to_owned()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "duplicate trusted CIDR at line {}",
+                            line + 1
+                        )));
+                    }
+                    let network = IpNetwork::parse(value).map_err(|reason| {
+                        ConfigError::Invalid(format!("{}:{}: {reason}", path.display(), line + 1))
+                    })?;
+                    trusted.push(network);
+                    if trusted.len() > 4096 {
+                        return Err(ConfigError::Invalid(
+                            "trusted proxy CIDR file exceeds 4096 entries".to_owned(),
+                        ));
+                    }
+                }
+                if trusted.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "trusted proxy CIDR file is empty".to_owned(),
+                    ));
+                }
+            }
+            (ClientIpMode::Cloudflare, None) => {
+                return Err(ConfigError::Invalid(
+                    "cloudflare mode requires client_ip.trusted_proxy_cidrs_file".to_owned(),
+                ));
+            }
+            (ClientIpMode::Direct, Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "direct mode must not configure trusted_proxy_cidrs_file".to_owned(),
+                ));
+            }
+            (ClientIpMode::Direct, None) => {}
+        }
+        Ok(ClientAddressPolicy::new(self.mode, trusted, health))
     }
 }

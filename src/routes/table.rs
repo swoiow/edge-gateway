@@ -7,6 +7,8 @@ use hyper::header::HeaderValue;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::routing::normalize_dns_host;
+
 const MAX_ROUTE_ID_LENGTH: usize = 128;
 const MAX_ROUTE_PATH_LENGTH: usize = 2048;
 const PC_ROUTE_PREFIX: &str = "/api/pc/";
@@ -15,13 +17,15 @@ const UAT_ROUTE_PREFIX: &str = "/api/uat/";
 
 pub(crate) struct RouteSpec {
     pub(crate) id: String,
+    pub(crate) host: String,
     pub(crate) path: String,
     pub(crate) backend: String,
     pub(crate) enabled: bool,
 }
 
 pub(crate) struct RouteTable {
-    enabled_by_path: HashMap<Arc<str>, Arc<Route>>,
+    enabled_by_host: HashMap<String, HashMap<Arc<str>, Arc<Route>>>,
+    enabled_count: usize,
     configured_count: usize,
 }
 
@@ -30,10 +34,16 @@ impl RouteTable {
         let configured_count = specs.len();
         let mut ids = HashSet::with_capacity(configured_count);
         let mut paths = HashSet::with_capacity(configured_count);
-        let mut enabled_by_path = HashMap::with_capacity(configured_count);
+        let mut enabled_by_host: HashMap<String, HashMap<Arc<str>, Arc<Route>>> = HashMap::new();
+        let mut enabled_count = 0;
 
         for spec in specs {
             validate_id(&spec.id)?;
+            let host =
+                normalize_dns_host(&spec.host).map_err(|reason| RouteError::InvalidHost {
+                    host: spec.host.clone(),
+                    reason,
+                })?;
             let namespace = validate_public_path(&spec.path)?;
             if namespace == RouteNamespace::Custom {
                 warn!(
@@ -46,30 +56,36 @@ impl RouteTable {
             if !ids.insert(spec.id.clone()) {
                 return Err(RouteError::DuplicateId(spec.id));
             }
-            if !paths.insert(spec.path.clone()) {
-                return Err(RouteError::DuplicatePath(spec.path));
+            if !paths.insert((host.clone(), spec.path.clone())) {
+                return Err(RouteError::DuplicateHostPath {
+                    host,
+                    path: spec.path,
+                });
             }
 
             let backend = BackendEndpoint::parse(&spec.backend)?;
             if spec.enabled {
                 let route = Arc::new(Route {
                     id: Arc::from(spec.id),
+                    host: Arc::from(host.clone()),
                     path: Arc::from(spec.path),
                     namespace,
                     backend,
                 });
-                enabled_by_path.insert(Arc::clone(&route.path), route);
+                enabled_by_host.entry(host).or_default().insert(Arc::clone(&route.path), route);
+                enabled_count += 1;
             }
         }
 
         Ok(Self {
-            enabled_by_path,
+            enabled_by_host,
+            enabled_count,
             configured_count,
         })
     }
 
-    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<Route>> {
-        self.enabled_by_path.get(path).cloned()
+    pub(crate) fn resolve(&self, host: &str, path: &str) -> Option<Arc<Route>> {
+        self.enabled_by_host.get(host)?.get(path).cloned()
     }
 
     pub(crate) fn configured_count(&self) -> usize {
@@ -77,18 +93,23 @@ impl RouteTable {
     }
 
     pub(crate) fn enabled_count(&self) -> usize {
-        self.enabled_by_path.len()
+        self.enabled_count
     }
 }
 
 pub(crate) struct Route {
     id: Arc<str>,
+    host: Arc<str>,
     path: Arc<str>,
     namespace: RouteNamespace,
     backend: BackendEndpoint,
 }
 
 impl Route {
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -333,8 +354,10 @@ pub(crate) enum RouteError {
     PathTooLong(String),
     #[error("duplicate route id {0:?}")]
     DuplicateId(String),
-    #[error("duplicate route path {0:?}")]
-    DuplicatePath(String),
+    #[error("duplicate route for host {host:?} and path {path:?}")]
+    DuplicateHostPath { host: String, path: String },
+    #[error("invalid route host {host:?}: {reason}")]
+    InvalidHost { host: String, reason: &'static str },
     #[error("invalid backend {backend:?}: {reason}")]
     InvalidBackend { backend: String, reason: String },
 }

@@ -22,11 +22,13 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
+use crate::gateway::admission::RequestLease;
 use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::h2_websocket::split_extended_connect_body;
 use crate::gateway::relay::{self, ConnectionContext, RelaySocket};
 use crate::observability::RuntimeObservability;
 use crate::routes::{BackendKind, Route, RouteNamespace};
+use crate::security::ResolvedClientAddress;
 
 type GatewayWebSocket = WebSocket<TokioIo<Upgraded>>;
 
@@ -66,9 +68,15 @@ impl WebSocketRuntime {
         &self,
         mut request: Request<Incoming>,
         route: Arc<Route>,
-        peer: SocketAddr,
+        client_address: ResolvedClientAddress,
         transport_connection_id: u64,
     ) -> Result<Response<ResponseBody>, AcceptError> {
+        let peer = client_address.peer;
+        let admission = request
+            .extensions()
+            .get::<Arc<RequestLease>>()
+            .cloned()
+            .ok_or(AcceptError::InvalidInternalState)?;
         if self.shutdown.is_cancelled() {
             return Err(AcceptError::ShuttingDown);
         }
@@ -122,6 +130,10 @@ impl WebSocketRuntime {
                             route_class = route.namespace().as_str(),
                             backend = route.backend().display(),
                             %peer,
+                            host = route.host(),
+                            client_ip = %client_address.client_ip,
+                            client_ip_source = client_address.client_ip_source,
+                            trusted_proxy = client_address.trusted_proxy,
                             cf_ray = cf_ray.as_deref().unwrap_or("-"),
                             downstream_http_version,
                             downstream_handshake = handshake_kind.as_str(),
@@ -140,6 +152,10 @@ impl WebSocketRuntime {
                             route_class = route.namespace().as_str(),
                             backend = route.backend().display(),
                             %peer,
+                            host = route.host(),
+                            client_ip = %client_address.client_ip,
+                            client_ip_source = client_address.client_ip_source,
+                            trusted_proxy = client_address.trusted_proxy,
                             cf_ray = cf_ray.as_deref().unwrap_or("-"),
                             downstream_http_version,
                             downstream_handshake = handshake_kind.as_str(),
@@ -161,6 +177,10 @@ impl WebSocketRuntime {
             route_class = route.namespace().as_str(),
             backend = route.backend().display(),
             %peer,
+            host = route.host(),
+            client_ip = %client_address.client_ip,
+            client_ip_source = client_address.client_ip_source,
+            trusted_proxy = client_address.trusted_proxy,
             cf_ray = cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version,
             downstream_handshake = handshake_kind.as_str(),
@@ -181,6 +201,8 @@ impl WebSocketRuntime {
                     downstream_upgrade,
                     backend,
                     RelayLaunchContext {
+                        client_address,
+                        admission: Arc::clone(&admission),
                         transport_connection_id,
                         connection_id,
                         peer,
@@ -200,6 +222,8 @@ impl WebSocketRuntime {
                 let downstream =
                     RelaySocket::from_io_halves(downstream_read, downstream_write, Role::Server);
                 let launch_context = RelayLaunchContext {
+                    client_address,
+                    admission: Arc::clone(&admission),
                     transport_connection_id,
                     connection_id,
                     peer,
@@ -248,33 +272,41 @@ impl WebSocketRuntime {
                 Ok(Err(error)) => {
                     observability.record_websocket_upgrade_failure();
                     warn!(
-                        transport_connection_id = context.transport_connection_id,
-                        connection_id = context.connection_id,
-                        route_id = context.route.id(),
-                        route_class = context.route.namespace().as_str(),
-                        peer = %context.peer,
-                        cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
-                        downstream_handshake = context.downstream_handshake,
-                        upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
-                        error = %error,
-                        "downstream WebSocket upgrade failed"
-                    );
+                                transport_connection_id = context.transport_connection_id,
+                                connection_id = context.connection_id,
+                                route_id = context.route.id(),
+                                route_class = context.route.namespace().as_str(),
+                                peer = %context.peer,
+                    host = context.route.host(),
+                    client_ip = %context.client_address.client_ip,
+                    client_ip_source = context.client_address.client_ip_source,
+                    trusted_proxy = context.client_address.trusted_proxy,
+                                cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
+                                downstream_handshake = context.downstream_handshake,
+                                upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
+                                error = %error,
+                                "downstream WebSocket upgrade failed"
+                            );
                     return;
                 }
                 Err(_) => {
                     observability.record_websocket_upgrade_timeout();
                     warn!(
-                        transport_connection_id = context.transport_connection_id,
-                        connection_id = context.connection_id,
-                        route_id = context.route.id(),
-                        route_class = context.route.namespace().as_str(),
-                        peer = %context.peer,
-                        cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
-                        downstream_handshake = context.downstream_handshake,
-                        timeout_seconds = upgrade_timeout.as_secs(),
-                        upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
-                        "downstream WebSocket upgrade timed out"
-                    );
+                                transport_connection_id = context.transport_connection_id,
+                                connection_id = context.connection_id,
+                                route_id = context.route.id(),
+                                route_class = context.route.namespace().as_str(),
+                                peer = %context.peer,
+                    host = context.route.host(),
+                    client_ip = %context.client_address.client_ip,
+                    client_ip_source = context.client_address.client_ip_source,
+                    trusted_proxy = context.client_address.trusted_proxy,
+                                cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
+                                downstream_handshake = context.downstream_handshake,
+                                timeout_seconds = upgrade_timeout.as_secs(),
+                                upgrade_duration_ms = upgrade_started.elapsed().as_millis(),
+                                "downstream WebSocket upgrade timed out"
+                            );
                     return;
                 }
             };
@@ -390,6 +422,10 @@ async fn start_relay(
             route_class = context.route.namespace().as_str(),
             backend = context.route.backend().display(),
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version = context.downstream_http_version,
             downstream_handshake = context.downstream_handshake,
@@ -406,6 +442,8 @@ async fn start_relay(
             transport_connection_id: context.transport_connection_id,
             connection_id: context.connection_id,
             peer: context.peer,
+            client_address: context.client_address,
+            _admission: context.admission,
             route: context.route,
             cf_ray: context.cf_ray,
             downstream_http_version: context.downstream_http_version,
@@ -439,6 +477,10 @@ async fn start_tcp_bridge(
             backend = context.route.backend().display(),
             backend_transport = "tcp",
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version = context.downstream_http_version,
             downstream_handshake = context.downstream_handshake,
@@ -455,6 +497,8 @@ async fn start_tcp_bridge(
             transport_connection_id: context.transport_connection_id,
             connection_id: context.connection_id,
             peer: context.peer,
+            client_address: context.client_address,
+            _admission: context.admission,
             route: context.route,
             cf_ray: context.cf_ray,
             downstream_http_version: context.downstream_http_version,
@@ -710,6 +754,8 @@ impl BackendConnection {
 }
 
 struct RelayLaunchContext {
+    client_address: ResolvedClientAddress,
+    admission: Arc<RequestLease>,
     transport_connection_id: u64,
     connection_id: u64,
     peer: SocketAddr,

@@ -11,9 +11,10 @@ use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue, UPGRADE};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Version};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnectionBuilder;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
@@ -23,15 +24,20 @@ use tracing::{debug, info, warn};
 use crate::acme::{AcmeManager, AcmeRuntime};
 use crate::config::{AcmeConfig, FallbackConfig, ObservabilityConfig, ServerConfig, TlsConfig};
 use crate::fallback::FallbackRuntime;
+use crate::gateway::admission::RequestLease;
 use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::websocket::WebSocketRuntime;
 use crate::grpc::{GrpcRouteTable, GrpcRuntime};
-use crate::observability::{ActiveConnection, RuntimeObservability};
+use crate::observability::{ActiveConnection, AdmissionRejection, RuntimeObservability};
 use crate::routes::RouteTable;
+use crate::routing::{RoutingPolicy, resolve_request_host};
+use crate::security::ClientAddressPolicy;
 use crate::tls::{CertificateStore, build_acceptor};
 
 pub(super) async fn run<F>(
     server_config: ServerConfig,
+    routing: Arc<RoutingPolicy>,
+    client_address: Arc<ClientAddressPolicy>,
     tls_config: TlsConfig,
     acme_config: AcmeConfig,
     observability_config: ObservabilityConfig,
@@ -110,7 +116,17 @@ where
         ),
         None => None,
     };
+    let transport_capacity = Arc::new(Semaphore::new(server_config.max_connections()));
+    let handshake_capacity = Arc::new(Semaphore::new(
+        server_config.max_concurrent_tls_handshakes(),
+    ));
+    let request_capacity = Arc::new(Semaphore::new(server_config.max_active_requests()));
     let service_state = ServiceState {
+        routing,
+        client_address,
+        server_config: Arc::clone(&server_config),
+        request_capacity,
+        observability: observability.clone(),
         routes: Arc::clone(&routes),
         websocket: websocket_runtime.clone(),
         grpc: grpc_runtime.clone(),
@@ -143,8 +159,25 @@ where
                 info!("shutdown signal received; stopping listener");
                 break;
             }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(error = %error, "connection task terminated unexpectedly");
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("failed to accept TCP connection")?;
+                if !service_state.client_address.permits_transport_peer(peer) {
+                    log_admission_rejection(&observability, AdmissionRejection::OriginPeer, peer);
+                    continue;
+                }
+                let transport_permit = match Arc::clone(&transport_capacity).try_acquire_owned() {
+                    Ok(permit) => Arc::new(permit),
+                    Err(_) => { log_admission_rejection(&observability, AdmissionRejection::ConnectionCapacity, peer); continue; }
+                };
+                let handshake_permit = match Arc::clone(&handshake_capacity).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => { log_admission_rejection(&observability, AdmissionRejection::HandshakeCapacity, peer); continue; }
+                };
                 let (transport_connection_id, active_connection) =
                     observability.begin_transport_connection();
                 let acceptor = tls_acceptor.clone();
@@ -155,6 +188,8 @@ where
                 let connection_observability = observability.clone();
 
                 let parameters = ConnectionParameters {
+                    transport_permit,
+                    handshake_permit,
                     acceptor,
                     cancellation: connection_cancellation,
                     handshake_timeout,
@@ -168,11 +203,6 @@ where
                 connections.spawn(async move {
                     serve_connection(stream, parameters).await;
                 });
-            }
-            completed = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    warn!(error = %error, "connection task terminated unexpectedly");
-                }
             }
         }
     }
@@ -217,6 +247,11 @@ where
 
 #[derive(Clone)]
 struct ServiceState {
+    routing: Arc<RoutingPolicy>,
+    client_address: Arc<ClientAddressPolicy>,
+    server_config: Arc<ServerConfig>,
+    request_capacity: Arc<Semaphore>,
+    observability: RuntimeObservability,
     routes: Arc<RouteTable>,
     websocket: WebSocketRuntime,
     grpc: GrpcRuntime,
@@ -224,6 +259,8 @@ struct ServiceState {
 }
 
 struct ConnectionParameters {
+    transport_permit: Arc<OwnedSemaphorePermit>,
+    handshake_permit: OwnedSemaphorePermit,
     acceptor: TlsAcceptor,
     cancellation: CancellationToken,
     handshake_timeout: Duration,
@@ -237,6 +274,8 @@ struct ConnectionParameters {
 
 async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
     let ConnectionParameters {
+        transport_permit,
+        handshake_permit,
         acceptor,
         cancellation,
         handshake_timeout,
@@ -276,6 +315,7 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
             return;
         }
     };
+    drop(handshake_permit);
     observability.record_tls_handshake_success();
 
     let downstream_sni = tls_stream.get_ref().1.server_name().map(str::to_owned);
@@ -308,6 +348,7 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
     let request_count = Arc::new(AtomicU64::new(0));
     let service_request_count = Arc::clone(&request_count);
     let service_downstream_sni = downstream_sni.clone();
+    let connection_server_config = Arc::clone(&state.server_config);
     let service = service_fn(move |request| {
         service_request_count.fetch_add(1, Ordering::Relaxed);
         handle_request(
@@ -316,11 +357,26 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
             peer,
             transport_connection_id,
             service_downstream_sni.clone(),
+            Arc::clone(&transport_permit),
         )
     });
     let io = TokioIo::new(tls_stream);
     let mut builder = AutoConnectionBuilder::new(TokioExecutor::new());
-    builder.http2().enable_connect_protocol();
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(connection_server_config.http_header_read_timeout())
+        .max_buf_size(connection_server_config.max_http_header_bytes());
+    // Preserve Hyper's stack-allocated default header parser when using 100.
+    if connection_server_config.max_http_header_count() != 100 {
+        builder.http1().max_headers(connection_server_config.max_http_header_count());
+    }
+    builder
+        .http2()
+        .enable_connect_protocol()
+        .max_concurrent_streams(connection_server_config.max_http2_concurrent_streams() as u32)
+        .max_header_list_size(connection_server_config.max_http_header_bytes() as u32)
+        .max_send_buf_size(connection_server_config.max_http2_send_buffer_bytes());
     let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
 
@@ -396,90 +452,155 @@ async fn serve_connection(stream: TcpStream, parameters: ConnectionParameters) {
 }
 
 async fn handle_request(
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
     state: ServiceState,
     peer: std::net::SocketAddr,
     transport_connection_id: u64,
     downstream_sni: Option<String>,
+    transport_permit: Arc<OwnedSemaphorePermit>,
 ) -> std::result::Result<Response<ResponseBody>, Infallible> {
     if request.method() == Method::GET
         && matches!(request.uri().path(), "/health/live" | "/health/ready")
     {
-        return Ok(text_response(StatusCode::OK, "ok\n"));
+        // Only explicit health peers bypass CF header resolution and domain routing.
+        return Ok(if state.client_address.permits_health_peer(peer) {
+            text_response(StatusCode::OK, "ok\n")
+        } else {
+            log_admission_rejection(&state.observability, AdmissionRejection::OriginPeer, peer);
+            text_response(StatusCode::FORBIDDEN, "forbidden\n")
+        });
     }
+    let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
+        total
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(32)
+    });
+    if request.headers().len() > state.server_config.max_http_header_count()
+        || header_bytes > state.server_config.max_http_header_bytes()
+    {
+        log_admission_rejection(&state.observability, AdmissionRejection::Headers, peer);
+        return Ok(text_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "headers too large\n",
+        ));
+    }
+    let client_address =
+        match state.client_address.resolve_trusted_client_address(peer, request.headers()) {
+            Ok(address) => address,
+            Err(_) => {
+                log_admission_rejection(
+                    &state.observability,
+                    AdmissionRejection::ClientIdentity,
+                    peer,
+                );
+                return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
+            }
+        };
+    let host = match resolve_request_host(&request) {
+        Ok(host) => host,
+        Err(_) => {
+            log_admission_rejection(&state.observability, AdmissionRejection::Authority, peer);
+            return Ok(text_response(
+                StatusCode::BAD_REQUEST,
+                "invalid authority\n",
+            ));
+        }
+    };
+    if !state.routing.permits_request_host(&host, downstream_sni.as_deref()) {
+        log_admission_rejection(&state.observability, AdmissionRejection::Authority, peer);
+        return Ok(text_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            "misdirected request\n",
+        ));
+    }
+    let request_permit = match Arc::clone(&state.request_capacity).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            log_admission_rejection(
+                &state.observability,
+                AdmissionRejection::RequestCapacity,
+                peer,
+            );
+            if state.grpc.resolve(&host, request.uri().path()).is_some()
+                && request.version() == Version::HTTP_2
+            {
+                let mut response = text_response(StatusCode::OK, "");
+                *response.version_mut() = Version::HTTP_2;
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+                response.headers_mut().insert("grpc-status", HeaderValue::from_static("8"));
+                response.headers_mut().insert(
+                    "grpc-message",
+                    HeaderValue::from_static("gateway%20capacity%20reached"),
+                );
+                return Ok(response);
+            }
+            return Ok(text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway capacity reached\n",
+            ));
+        }
+    };
+    let admission = RequestLease::new(request_permit, transport_permit);
+    request.extensions_mut().insert(Arc::clone(&admission));
+    crate::security::sanitize_client_address_headers(request.headers_mut(), client_address);
 
     let path = request.uri().path();
-    if let Some(route) = state.routes.resolve(path) {
-        return match state
+    let response = if let Some(route) = state.routes.resolve(&host, path) {
+        match state
             .websocket
-            .accept(request, Arc::clone(&route), peer, transport_connection_id)
+            .accept(
+                request,
+                Arc::clone(&route),
+                client_address,
+                transport_connection_id,
+            )
             .await
         {
-            Ok(response) => Ok(response),
+            Ok(response) => response,
             Err(error) => {
-                if error.is_backend_failure() {
-                    warn!(
-                        transport_connection_id,
-                        route_id = route.id(),
-                        route_class = route.namespace().as_str(),
-                        backend = route.backend().display(),
-                        %peer,
-                        error = %error,
-                        "WebSocket request rejected"
-                    );
-                } else {
-                    debug!(
-                        transport_connection_id,
-                        route_id = route.id(),
-                        route_class = route.namespace().as_str(),
-                        %peer,
-                        error = %error,
-                        "WebSocket request rejected"
-                    );
-                }
-
+                // Client rejections do not emit one warning per attacker request.
+                debug!(transport_connection_id, route_id = route.id(), host = route.host(),
+                    %peer, client_ip = %client_address.client_ip,
+                    client_ip_source = client_address.client_ip_source,
+                    trusted_proxy = client_address.trusted_proxy, backend_failure = error.is_backend_failure(), error = %error, "WebSocket request rejected");
                 let mut response = text_response(error.status(), error.public_message());
                 if error.should_advertise_http1_upgrade() {
                     response.headers_mut().insert(UPGRADE, HeaderValue::from_static("websocket"));
                 }
-                Ok(response)
+                response
             }
-        };
-    }
-
-    if let Some(route) = state.grpc.resolve(path) {
-        return Ok(state.grpc.proxy(request, route, peer, transport_connection_id).await);
-    }
-
-    if let Some(fallback) = &state.fallback {
-        return Ok(fallback
-            .proxy(
-                request,
-                peer,
-                transport_connection_id,
-                downstream_sni.as_deref(),
-            )
-            .await);
-    }
-
-    debug!(
-        transport_connection_id,
-        %peer,
-        http_version = http_version(request.version()),
-        method = %request.method(),
-        "request did not match a configured route"
-    );
-    Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
+        }
+    } else if let Some(route) = state.grpc.resolve(&host, path) {
+        state.grpc.proxy(request, route, client_address, transport_connection_id).await
+    } else if let Some(fallback) = &state.fallback {
+        if fallback.permits_host(&host) {
+            fallback
+                .proxy(
+                    request,
+                    peer,
+                    transport_connection_id,
+                    downstream_sni.as_deref(),
+                )
+                .await
+        } else {
+            text_response(StatusCode::NOT_FOUND, "not found\n")
+        }
+    } else {
+        text_response(StatusCode::NOT_FOUND, "not found\n")
+    };
+    Ok(response.map(|response_body| body::with_admission(response_body, admission)))
 }
 
-fn http_version(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "HTTP/0.9",
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_11 => "HTTP/1.1",
-        Version::HTTP_2 => "HTTP/2",
-        Version::HTTP_3 => "HTTP/3",
-        _ => "unknown",
+fn log_admission_rejection(
+    observability: &RuntimeObservability,
+    reason: AdmissionRejection,
+    peer: std::net::SocketAddr,
+) {
+    if observability.record_admission_rejection(reason) {
+        warn!(%peer, reason = reason.as_str(), "gateway admission rejection (sampled)");
     }
 }
 

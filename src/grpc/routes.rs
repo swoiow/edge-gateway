@@ -6,18 +6,22 @@ use hyper::Uri;
 use hyper::header::HeaderValue;
 use thiserror::Error;
 
+use crate::routing::normalize_dns_host;
+
 const MAX_ROUTE_ID_LENGTH: usize = 128;
 const MAX_GRPC_PATH_LENGTH: usize = 2048;
 
 pub(crate) struct GrpcRouteSpec {
     pub(crate) id: String,
+    pub(crate) host: String,
     pub(crate) path: String,
     pub(crate) backend: String,
     pub(crate) enabled: bool,
 }
 
 pub(crate) struct GrpcRouteTable {
-    enabled_by_path: HashMap<Arc<str>, Arc<GrpcRoute>>,
+    enabled_by_host: HashMap<String, HashMap<Arc<str>, Arc<GrpcRoute>>>,
+    enabled_count: usize,
     configured_count: usize,
 }
 
@@ -26,17 +30,27 @@ impl GrpcRouteTable {
         let configured_count = specs.len();
         let mut ids = HashSet::with_capacity(configured_count);
         let mut paths = HashSet::with_capacity(configured_count);
-        let mut enabled_by_path = HashMap::with_capacity(configured_count);
+        let mut enabled_by_host: HashMap<String, HashMap<Arc<str>, Arc<GrpcRoute>>> =
+            HashMap::new();
+        let mut enabled_count = 0;
 
         for spec in specs {
             validate_id(&spec.id)?;
+            let host =
+                normalize_dns_host(&spec.host).map_err(|reason| GrpcRouteError::InvalidHost {
+                    host: spec.host.clone(),
+                    reason,
+                })?;
             validate_grpc_path(&spec.path)?;
 
             if !ids.insert(spec.id.clone()) {
                 return Err(GrpcRouteError::DuplicateId(spec.id));
             }
-            if !paths.insert(spec.path.clone()) {
-                return Err(GrpcRouteError::DuplicatePath(spec.path));
+            if !paths.insert((host.clone(), spec.path.clone())) {
+                return Err(GrpcRouteError::DuplicateHostPath {
+                    host,
+                    path: spec.path,
+                });
             }
 
             let backend = GrpcBackendEndpoint::parse(&spec.backend)?;
@@ -50,22 +64,25 @@ impl GrpcRouteTable {
             if spec.enabled {
                 let route = Arc::new(GrpcRoute {
                     id: Arc::from(spec.id),
+                    host: Arc::from(host.clone()),
                     path: Arc::from(spec.path),
                     backend,
                     upstream_uri,
                 });
-                enabled_by_path.insert(Arc::clone(&route.path), route);
+                enabled_by_host.entry(host).or_default().insert(Arc::clone(&route.path), route);
+                enabled_count += 1;
             }
         }
 
         Ok(Self {
-            enabled_by_path,
+            enabled_by_host,
+            enabled_count,
             configured_count,
         })
     }
 
-    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<GrpcRoute>> {
-        self.enabled_by_path.get(path).cloned()
+    pub(crate) fn resolve(&self, host: &str, path: &str) -> Option<Arc<GrpcRoute>> {
+        self.enabled_by_host.get(host)?.get(path).cloned()
     }
 
     pub(crate) fn configured_count(&self) -> usize {
@@ -73,22 +90,27 @@ impl GrpcRouteTable {
     }
 
     pub(crate) fn enabled_count(&self) -> usize {
-        self.enabled_by_path.len()
+        self.enabled_count
     }
 
     pub(crate) fn enabled_routes(&self) -> impl Iterator<Item = &Arc<GrpcRoute>> {
-        self.enabled_by_path.values()
+        self.enabled_by_host.values().flat_map(|routes| routes.values())
     }
 }
 
 pub(crate) struct GrpcRoute {
     id: Arc<str>,
+    host: Arc<str>,
     path: Arc<str>,
     backend: GrpcBackendEndpoint,
     upstream_uri: Uri,
 }
 
 impl GrpcRoute {
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -214,8 +236,10 @@ pub(crate) enum GrpcRouteError {
     PathTooLong(String),
     #[error("duplicate gRPC route id {0:?}")]
     DuplicateId(String),
-    #[error("duplicate gRPC route path {0:?}")]
-    DuplicatePath(String),
+    #[error("duplicate gRPC route for host {host:?} and path {path:?}")]
+    DuplicateHostPath { host: String, path: String },
+    #[error("invalid gRPC route host {host:?}: {reason}")]
+    InvalidHost { host: String, reason: &'static str },
     #[error("invalid gRPC backend {backend:?}: {reason}")]
     InvalidBackend { backend: String, reason: String },
 }

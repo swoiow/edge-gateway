@@ -14,7 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -46,16 +46,24 @@ impl Http01Server {
 
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
+            let capacity = Arc::new(Semaphore::new(128));
             info!(listen = %local_addr, "ACME HTTP-01 listener started");
             loop {
                 tokio::select! {
                     biased;
                     () = task_cancellation.cancelled() => break,
+                    completed = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = completed {
+                            warn!(error = %error, "ACME HTTP-01 connection task terminated unexpectedly");
+                        }
+                    }
                     accepted = listener.accept() => {
                         match accepted {
                             Ok((stream, peer)) => {
+                                let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() else { continue; };
                                 let challenges = Arc::clone(&task_challenges);
                                 connections.spawn(async move {
+                                    let _permit = permit;
                                     let service = service_fn(move |request| {
                                         handle_request(request, Arc::clone(&challenges))
                                     });
@@ -80,11 +88,6 @@ impl Http01Server {
                             Err(error) => {
                                 warn!(error = %error, "ACME HTTP-01 accept failed");
                             }
-                        }
-                    }
-                    completed = connections.join_next(), if !connections.is_empty() => {
-                        if let Some(Err(error)) = completed {
-                            warn!(error = %error, "ACME HTTP-01 connection task terminated unexpectedly");
                         }
                     }
                 }

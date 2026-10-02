@@ -18,10 +18,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::ObservabilityMode;
+use crate::gateway::admission::RequestLease;
 use crate::observability::{
     ActiveConnection, RelayDirection, RuntimeObservability, WebSocketCloseClass,
 };
 use crate::routes::Route;
+use crate::security::ResolvedClientAddress;
 
 type BoxedRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
 type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
@@ -66,6 +68,8 @@ pub(super) struct ConnectionContext {
     pub(super) transport_connection_id: u64,
     pub(super) connection_id: u64,
     pub(super) peer: SocketAddr,
+    pub(super) client_address: ResolvedClientAddress,
+    pub(super) _admission: Arc<RequestLease>,
     pub(super) route: Arc<Route>,
     pub(super) cf_ray: Option<String>,
     pub(super) downstream_http_version: &'static str,
@@ -99,6 +103,10 @@ pub(super) async fn run(
             route_path = context.route.path(),
             backend = context.route.backend().display(),
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version = context.downstream_http_version,
             active_websocket_connections =
@@ -108,8 +116,7 @@ pub(super) async fn run(
     }
 
     let runtime_observation_enabled = context.observability.mode() != ObservabilityMode::Off;
-    let detailed_observation = context.observability.mode() == ObservabilityMode::Diagnostic
-        || context.observability.connection_event_logs_enabled();
+    let detailed_observation = context.observability.detailed_frame_observation_enabled();
     let client_to_backend = Arc::new(DirectionDiagnostics::new(
         Instant::now(),
         runtime_observation_enabled || detailed_observation,
@@ -286,6 +293,10 @@ pub(super) async fn run_tcp_backend(
             backend = context.route.backend().display(),
             backend_transport = "tcp",
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version = context.downstream_http_version,
             active_websocket_connections = context.active_connection.active_connections(),
@@ -294,8 +305,7 @@ pub(super) async fn run_tcp_backend(
     }
 
     let runtime_observation_enabled = context.observability.mode() != ObservabilityMode::Off;
-    let detailed_observation = context.observability.mode() == ObservabilityMode::Diagnostic
-        || context.observability.connection_event_logs_enabled();
+    let detailed_observation = context.observability.detailed_frame_observation_enabled();
     let client_to_backend = Arc::new(DirectionDiagnostics::new(
         Instant::now(),
         runtime_observation_enabled || detailed_observation,
@@ -801,6 +811,29 @@ fn log_closed(
     upstream: &DirectionSnapshot,
     downstream: &DirectionSnapshot,
 ) {
+    if context.observability.connection_event_logs_enabled()
+        && !context.observability.detailed_frame_observation_enabled()
+    {
+        info!(
+            transport_connection_id = context.transport_connection_id,
+            connection_id = context.connection_id,
+            route_id = context.route.id(),
+            host = context.route.host(),
+            peer = %context.peer,
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
+            close_reason = close_reason.as_str(),
+            duration_ms,
+            active_websocket_connections = remaining_active,
+            first_error_direction,
+            first_error_stage,
+            client_to_backend_bytes = upstream.forwarded_bytes,
+            backend_to_client_bytes = downstream.forwarded_bytes,
+            "websocket relay closed"
+        );
+        return;
+    }
     let client_to_backend_average_frame_bytes =
         average(upstream.forwarded_bytes, upstream.forwarded_frames);
     let backend_to_client_average_frame_bytes =
@@ -817,6 +850,10 @@ fn log_closed(
             route_class = context.route.namespace().as_str(),
             backend = context.route.backend().display(),
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             downstream_http_version = context.downstream_http_version,
             close_reason = close_reason.as_str(),
@@ -870,6 +907,10 @@ fn log_closed(
             route_class = context.route.namespace().as_str(),
             backend = context.route.backend().display(),
             peer = %context.peer,
+            host = context.route.host(),
+            client_ip = %context.client_address.client_ip,
+            client_ip_source = context.client_address.client_ip_source,
+            trusted_proxy = context.client_address.trusted_proxy,
             cf_ray = context.cf_ray.as_deref().unwrap_or("-"),
             close_reason = close_reason.as_str(),
             duration_ms,
@@ -1154,11 +1195,11 @@ impl DirectionDiagnostics {
             return;
         }
         self.forwarded_frames.fetch_add(1, Ordering::Relaxed);
+        self.forwarded_bytes.fetch_add(payload_bytes as u64, Ordering::Relaxed);
         if !self.detailed {
             self.set_stage(RelayStage::AwaitingRead);
             return;
         }
-        self.forwarded_bytes.fetch_add(payload_bytes as u64, Ordering::Relaxed);
         self.last_activity_elapsed_ms.store(self.elapsed_millis(), Ordering::Relaxed);
         self.last_write_elapsed_ms.store(self.elapsed_millis(), Ordering::Relaxed);
         self.set_stage(RelayStage::AwaitingRead);

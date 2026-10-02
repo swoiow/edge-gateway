@@ -3,49 +3,62 @@ listen = "0.0.0.0:8443"
 tls_handshake_timeout_seconds = 10
 websocket_upgrade_timeout_seconds = 10
 backend_connect_timeout_seconds = 3
-shutdown_grace_seconds = 120
+shutdown_grace_seconds = 30
 max_websocket_message_size_bytes = 1048576
 max_grpc_concurrent_streams_per_backend = 256
+max_connections = 20000
+max_concurrent_tls_handshakes = 512
+max_active_requests = 20000
+max_http_header_count = 100
+max_http_header_bytes = 32768
+http_header_read_timeout_seconds = 10
+max_http2_concurrent_streams = 256
+max_http2_send_buffer_bytes = 65536
 
-# Certificate pairs are discovered by id:
-#   certs/gateway.fullchain.pem + certs/gateway.key.pem
-#   certs/service-a.fullchain.pem + certs/service-a.key.pem
-# SNI names are read from each certificate's DNS SANs, not from the filename.
 [tls]
 cert_dir = "certs"
 cert_suffix = ".fullchain.pem"
 key_suffix = ".key.pem"
 default_certificate = "gateway"
 
-# Built-in ACME is optional. When disabled, certificates can be managed manually
-# or by an external ACME/DNS-01 client and are still served through the same
-# multi-certificate store.
+[routing]
+require_sni = true
+# Default: request host must equal SNI. Explicit binding overrides this default
+# for that SNI, permitting only the listed configured hosts, on every H2 stream.
+# [[routing.sni_bindings]]
+# sni = "origin.example.com"
+# hosts = ["a.example.com", "b.example.com"]
+
+[client_ip]
+mode = "cloudflare"
+trusted_proxy_cidrs_file = "config/cloudflare-origin-cidrs.txt"
+# These peers may connect for GET /health/live|ready only. They do not become
+# trusted proxies and cannot access business routes in cloudflare mode.
+health_peer_cidrs = ["127.0.0.0/8", "::1/128"]
+
 [acme]
 enabled = false
 http01_listen = "0.0.0.0:80"
-environment = "production" # use "staging" while testing ACME integration
+environment = "staging"
 state_dir = "state/acme"
 fallback_renew_before_days = 30
 check_interval_hours = 12
 # email = "admin@example.com"
-
-# Uncomment together with acme.enabled = true and acme.email.
-# Wildcards are intentionally unsupported here because HTTP-01 cannot issue them.
 # [[acme.certificates]]
 # id = "gateway"
-# domains = ["gateway.example.com", "api.example.com"]
+# domains = ["a.example.com", "b.example.com"]
+# HTTP-01 has its own bounded challenge-only listener. A CF-only firewall on
+# the TLS business port must not inadvertently block direct CA validation :80.
 
-
-# Optional legacy fallback. Explicit edge WebSocket/gRPC routes always win;
-# only unmatched requests are forwarded here. For an existing TLS-enabled
-# Nginx, move its public listener to loopback (for example 127.0.0.1:9443).
-# Host is preserved and TLS SNI defaults to the original downstream SNI/Host.
 [fallback]
 enabled = false
+# Required even in this disabled example. Only these domains may use fallback.
+hosts = ["a.example.com", "b.example.com"]
 backend = "https://127.0.0.1:9443"
 preserve_host = true
+# Upstream TLS identity follows the HTTP request host, not downstream SNI.
 tls_server_name = "request_host"
-# ca_file = "certs/cloudflare-origin-ca.pem" # only needed for a private/origin CA
+# ca_file = "certs/cloudflare-origin-ca.pem"
 
 [observability]
 mode = "production"
@@ -54,31 +67,42 @@ summary_file = "observability-runtime-production.jsonl"
 diagnostic_interval_seconds = 60
 diagnostic_file = "observability-runtime-diagnostic.jsonl"
 connection_event_logs_enabled = true
+# Lifecycle logs never imply per-frame diagnostics. Diagnostic mode still
+# enables detail; use this flag for an explicit production diagnostic session.
+detailed_frame_observation_enabled = false
 
-# [[routes]] is the WebSocket ingress table. Backend transport is selected by URI:
-#   ws://...  -> terminate downstream WSS/WS and proxy to a WebSocket backend
-#   tcp://... -> terminate downstream WSS/WS and stream payload bytes to raw TCP
-# Custom absolute paths are allowed. Paths outside /api/pc|mob|uat emit a warning only.
+# Same ingress path, different domains and upstream paths.
 [[routes]]
-id = "route-z"
-path = "/custom-ws1"
-backend = "tcp://127.0.0.1:33301"
+id = "a-api"
+host = "a.example.com"
+path = "/api"
+backend = "ws://127.0.0.1:9001/socket"
 enabled = true
 
 [[routes]]
-id = "route-a"
-path = "/custom-ws2"
-backend = "ws://127.0.0.1:10002/app1"
+id = "b-api"
+host = "b.example.com"
+path = "/api"
+backend = "ws://127.0.0.1:9002/socket"
 enabled = true
 
 [[routes]]
-id = "develop"
-path = "/api/uat/health"
-backend = "ws://127.0.0.1:10002/app2"
+id = "a-tcp"
+host = "a.example.com"
+path = "/tcp"
+backend = "tcp://127.0.0.1:9003"
 enabled = true
 
 [[grpc_routes]]
-id = "grpc-tun"
-path = "/xzy/Tun"
+id = "a-grpc"
+host = "a.example.com"
+path = "/edge.Gateway/Tun"
 backend = "h2c://127.0.0.1:50051"
+enabled = true
+
+[[grpc_routes]]
+id = "b-grpc"
+host = "b.example.com"
+path = "/edge.Gateway/Tun"
+backend = "h2c://127.0.0.1:50052"
 enabled = true

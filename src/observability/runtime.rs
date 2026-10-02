@@ -52,6 +52,7 @@ pub(crate) enum WebSocketCloseClass {
 struct Inner {
     mode: ObservabilityMode,
     connection_event_logs_enabled: bool,
+    detailed_frame_observation_enabled: bool,
     summary_interval_seconds: u64,
     diagnostic_interval_seconds: u64,
     next_transport_connection_id: AtomicU64,
@@ -61,6 +62,14 @@ struct Inner {
 
 #[derive(Default)]
 struct Counters {
+    origin_peer_rejections_total: AtomicU64,
+    connection_capacity_rejections_total: AtomicU64,
+    handshake_capacity_rejections_total: AtomicU64,
+    request_capacity_rejections_total: AtomicU64,
+    client_identity_rejections_total: AtomicU64,
+    authority_rejections_total: AtomicU64,
+    http_header_rejections_total: AtomicU64,
+
     active_transport_connections: AtomicU64,
     peak_transport_connections: AtomicU64,
     transport_connections_total: AtomicU64,
@@ -101,7 +110,54 @@ struct DirectionCounters {
     frames_gt_262144_bytes_total: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionRejection {
+    OriginPeer,
+    ConnectionCapacity,
+    HandshakeCapacity,
+    RequestCapacity,
+    ClientIdentity,
+    Authority,
+    Headers,
+}
+impl AdmissionRejection {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginPeer => "origin_peer_rejections_total",
+            Self::ConnectionCapacity => "connection_capacity_rejections_total",
+            Self::HandshakeCapacity => "handshake_capacity_rejections_total",
+            Self::RequestCapacity => "request_capacity_rejections_total",
+            Self::ClientIdentity => "client_identity_rejections_total",
+            Self::Authority => "authority_rejections_total",
+            Self::Headers => "http_header_rejections_total",
+        }
+    }
+}
+
 impl RuntimeObservability {
+    /// Aggregate every rejection, but log only counts 1, 2, 4, 8... per reason.
+    /// Under a flood this remains logarithmic rather than one log per request.
+    pub(crate) fn record_admission_rejection(&self, reason: AdmissionRejection) -> bool {
+        let counter = match reason {
+            AdmissionRejection::OriginPeer => &self.inner.counters.origin_peer_rejections_total,
+            AdmissionRejection::ConnectionCapacity => {
+                &self.inner.counters.connection_capacity_rejections_total
+            }
+            AdmissionRejection::HandshakeCapacity => {
+                &self.inner.counters.handshake_capacity_rejections_total
+            }
+            AdmissionRejection::RequestCapacity => {
+                &self.inner.counters.request_capacity_rejections_total
+            }
+            AdmissionRejection::ClientIdentity => {
+                &self.inner.counters.client_identity_rejections_total
+            }
+            AdmissionRejection::Authority => &self.inner.counters.authority_rejections_total,
+            AdmissionRejection::Headers => &self.inner.counters.http_header_rejections_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed).saturating_add(1).is_power_of_two()
+    }
+
     pub(crate) async fn start(
         config: ObservabilityConfig,
         shutdown: CancellationToken,
@@ -109,6 +165,7 @@ impl RuntimeObservability {
         let inner = Arc::new(Inner {
             mode: config.mode(),
             connection_event_logs_enabled: config.connection_event_logs_enabled(),
+            detailed_frame_observation_enabled: config.detailed_frame_observation_enabled(),
             summary_interval_seconds: config.summary_interval().as_secs(),
             diagnostic_interval_seconds: config.diagnostic_interval().as_secs(),
             next_transport_connection_id: AtomicU64::new(1),
@@ -146,6 +203,11 @@ impl RuntimeObservability {
 
     pub(crate) fn mode(&self) -> ObservabilityMode {
         self.inner.mode
+    }
+
+    pub(crate) fn detailed_frame_observation_enabled(&self) -> bool {
+        self.inner.mode == ObservabilityMode::Diagnostic
+            || self.inner.detailed_frame_observation_enabled
     }
 
     pub(crate) fn connection_event_logs_enabled(&self) -> bool {
@@ -480,6 +542,42 @@ fn snapshot_json(inner: &Inner) -> String {
         load(&counters.websocket_backend_connect_timeouts_total),
         load(&counters.websocket_relay_failures_total),
         load(&counters.websocket_no_progress_events_total),
+    );
+
+    let _ = write!(
+        json,
+        ",\"origin_peer_rejections_total\":{}",
+        load(&counters.origin_peer_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"connection_capacity_rejections_total\":{}",
+        load(&counters.connection_capacity_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"handshake_capacity_rejections_total\":{}",
+        load(&counters.handshake_capacity_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"request_capacity_rejections_total\":{}",
+        load(&counters.request_capacity_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"client_identity_rejections_total\":{}",
+        load(&counters.client_identity_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"authority_rejections_total\":{}",
+        load(&counters.authority_rejections_total)
+    );
+    let _ = write!(
+        json,
+        ",\"http_header_rejections_total\":{}",
+        load(&counters.http_header_rejections_total)
     );
 
     if inner.mode == ObservabilityMode::Diagnostic {

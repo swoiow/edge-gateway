@@ -5,6 +5,8 @@ mod gateway;
 mod grpc;
 mod observability;
 mod routes;
+mod routing;
+mod security;
 mod tls;
 
 use std::ffi::OsString;

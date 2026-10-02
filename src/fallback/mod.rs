@@ -25,6 +25,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, warn};
 
 use crate::config::{FallbackConfig, FallbackScheme, FallbackTlsServerName};
+use crate::gateway::admission::RequestLease;
 use crate::gateway::body::{self, ResponseBody};
 
 #[derive(Clone)]
@@ -76,6 +77,10 @@ impl FallbackRuntime {
         })
     }
 
+    pub(crate) fn permits_host(&self, host: &str) -> bool {
+        self.config.permits_host(host)
+    }
+
     pub(crate) async fn proxy(
         &self,
         mut request: Request<Incoming>,
@@ -101,7 +106,14 @@ impl FallbackRuntime {
                 return text_response(StatusCode::BAD_REQUEST, "host/authority required\n");
             }
         };
-        let tls_name = match self.resolve_tls_server_name(downstream_sni, &host) {
+        let normalized_host = match crate::routing::resolve_request_host(&request) {
+            Ok(host) => host,
+            Err(_) => return text_response(StatusCode::BAD_REQUEST, "invalid authority\n"),
+        };
+        if !self.config.permits_host(&normalized_host) {
+            return text_response(StatusCode::MISDIRECTED_REQUEST, "misdirected request\n");
+        }
+        let tls_name = match self.resolve_tls_server_name(&host) {
             Ok(value) => value,
             Err(error) => {
                 warn!(
@@ -228,6 +240,7 @@ impl FallbackRuntime {
             .context("failed to construct fallback HTTP/1 request target")?;
         *request.uri_mut() = path_and_query;
 
+        let admission = request.extensions_mut().remove::<Arc<RequestLease>>();
         let downstream_upgrade = is_upgrade.then(|| upgrade::on(&mut request));
         let (mut sender, connection) = timeout(
             self.connect_timeout,
@@ -266,6 +279,7 @@ impl FallbackRuntime {
                 let upstream_upgrade = upgrade::on(&mut response);
                 let shutdown = self.shutdown.child_token();
                 let tunnel = self.tasks.spawn(async move {
+                    let _admission = admission;
                     let (downstream, upstream) = tokio::join!(downstream_upgrade, upstream_upgrade);
                     let (Ok(downstream), Ok(upstream)) = (downstream, upstream) else {
                         warn!("fallback HTTP upgrade did not complete on both sides");
@@ -393,18 +407,15 @@ impl FallbackRuntime {
         Ok(tls)
     }
 
-    fn resolve_tls_server_name(
-        &self,
-        downstream_sni: Option<&str>,
-        request_host: &str,
-    ) -> Result<Option<String>> {
+    fn resolve_tls_server_name(&self, request_host: &str) -> Result<Option<String>> {
         if self.config.scheme() == FallbackScheme::Http {
             return Ok(None);
         }
         let name = match self.config.tls_server_name() {
-            FallbackTlsServerName::RequestHost => downstream_sni
-                .map(str::to_owned)
-                .unwrap_or_else(|| strip_port(request_host).to_owned()),
+            FallbackTlsServerName::RequestHost => {
+                crate::routing::normalize_dns_host(strip_port(request_host))
+                    .map_err(|reason| anyhow!(reason))?
+            }
             FallbackTlsServerName::Literal(name) => name.clone(),
         };
         if name.is_empty() {
@@ -487,11 +498,7 @@ fn request_authority(request: &Request<Incoming>) -> Result<String> {
         .map(|value| value.to_str().context("Host header is not valid ASCII"))
         .transpose()?;
 
-    if let (Some(uri_authority), Some(host_header)) = (uri_authority, host_header) {
-        if !uri_authority.eq_ignore_ascii_case(host_header) {
-            bail!("request URI authority and Host header do not match");
-        }
-    }
+    crate::routing::resolve_request_host(request).map_err(|reason| anyhow!(reason))?;
 
     let authority =
         uri_authority.or(host_header).ok_or_else(|| anyhow!("missing Host/authority"))?;

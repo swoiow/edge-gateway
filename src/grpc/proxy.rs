@@ -24,8 +24,10 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use super::{GrpcBackendEndpoint, GrpcRoute, GrpcRouteTable};
+use crate::gateway::admission::RequestLease;
 use crate::gateway::body::{self, ResponseBody};
 use crate::observability::RuntimeObservability;
+use crate::security::ResolvedClientAddress;
 
 #[derive(Clone)]
 pub(crate) struct GrpcRuntime {
@@ -70,8 +72,8 @@ impl GrpcRuntime {
         }
     }
 
-    pub(crate) fn resolve(&self, path: &str) -> Option<Arc<GrpcRoute>> {
-        self.routes.resolve(path)
+    pub(crate) fn resolve(&self, host: &str, path: &str) -> Option<Arc<GrpcRoute>> {
+        self.routes.resolve(host, path)
     }
 
     pub(crate) fn configured_route_count(&self) -> usize {
@@ -86,9 +88,10 @@ impl GrpcRuntime {
         &self,
         request: Request<Incoming>,
         route: Arc<GrpcRoute>,
-        peer: SocketAddr,
+        client_address: ResolvedClientAddress,
         transport_connection_id: u64,
     ) -> Response<ResponseBody> {
+        let peer = client_address.peer;
         let cf_ray = request
             .headers()
             .get("cf-ray")
@@ -100,6 +103,10 @@ impl GrpcRuntime {
                 route_id = route.id(),
                 backend = route.backend().display(),
                 %peer,
+                host = route.host(),
+                client_ip = %client_address.client_ip,
+                client_ip_source = client_address.client_ip_source,
+                trusted_proxy = client_address.trusted_proxy,
                 cf_ray = cf_ray.as_deref().unwrap_or("-"),
                 http_version = ?request.version(),
                 method = %request.method(),
@@ -111,6 +118,10 @@ impl GrpcRuntime {
                 route_id = route.id(),
                 backend = route.backend().display(),
                 %peer,
+                host = route.host(),
+                client_ip = %client_address.client_ip,
+                client_ip_source = client_address.client_ip_source,
+                trusted_proxy = client_address.trusted_proxy,
                 cf_ray = cf_ray.as_deref().unwrap_or("-"),
                 http_version = ?request.version(),
                 method = %request.method(),
@@ -142,6 +153,10 @@ impl GrpcRuntime {
                 route_id = route.id(),
                 backend = route.backend().display(),
                 %peer,
+                host = route.host(),
+                client_ip = %client_address.client_ip,
+                client_ip_source = client_address.client_ip_source,
+                trusted_proxy = client_address.trusted_proxy,
                 "gRPC route has no upstream runtime"
             );
             return grpc_failure_response("14", "upstream%20unavailable");
@@ -154,12 +169,19 @@ impl GrpcRuntime {
                     route_id = route.id(),
                     backend = route.backend().display(),
                     %peer,
+                host = route.host(),
+                client_ip = %client_address.client_ip,
+                client_ip_source = client_address.client_ip_source,
+                trusted_proxy = client_address.trusted_proxy,
                     "gRPC per-backend concurrency limit reached"
                 );
                 return grpc_failure_response("8", "upstream%20concurrency%20limit%20reached");
             }
         };
-        let lease = Arc::new(StreamLease::new(permit));
+        let Some(admission) = request.extensions().get::<Arc<RequestLease>>().cloned() else {
+            return grpc_failure_response("13", "internal%20admission%20error");
+        };
+        let lease = Arc::new(StreamLease::new(permit, admission));
 
         let (mut parts, request_body) = request.into_parts();
         parts.uri = route.upstream_uri().clone();
@@ -180,6 +202,7 @@ impl GrpcRuntime {
                     route.id().to_owned(),
                     route.backend().display().to_owned(),
                     peer,
+                    client_address,
                     cf_ray,
                 );
                 Response::from_parts(parts, body::boxed(response_body))
@@ -189,6 +212,10 @@ impl GrpcRuntime {
                     route_id = route.id(),
                     backend = route.backend().display(),
                     %peer,
+                host = route.host(),
+                client_ip = %client_address.client_ip,
+                client_ip_source = client_address.client_ip_source,
+                trusted_proxy = client_address.trusted_proxy,
                     error = %error,
                     "gRPC upstream request failed"
                 );
@@ -399,11 +426,15 @@ fn grpc_failure_response(status: &'static str, message: &'static str) -> Respons
 
 struct StreamLease {
     _permit: OwnedSemaphorePermit,
+    _admission: Arc<RequestLease>,
 }
 
 impl StreamLease {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self { _permit: permit }
+    fn new(permit: OwnedSemaphorePermit, admission: Arc<RequestLease>) -> Self {
+        Self {
+            _permit: permit,
+            _admission: admission,
+        }
     }
 }
 
@@ -451,6 +482,7 @@ struct GrpcResponseBody {
     route_id: String,
     backend: String,
     peer: SocketAddr,
+    client_address: ResolvedClientAddress,
     cf_ray: Option<String>,
     started_at: Instant,
     finished: bool,
@@ -463,6 +495,7 @@ impl GrpcResponseBody {
         route_id: String,
         backend: String,
         peer: SocketAddr,
+        client_address: ResolvedClientAddress,
         cf_ray: Option<String>,
     ) -> Self {
         Self {
@@ -471,6 +504,7 @@ impl GrpcResponseBody {
             route_id,
             backend,
             peer,
+            client_address,
             cf_ray,
             started_at: Instant::now(),
             finished: false,
@@ -488,6 +522,9 @@ impl GrpcResponseBody {
             route_id = %self.route_id,
             backend = %self.backend,
             peer = %self.peer,
+            client_ip = %self.client_address.client_ip,
+            client_ip_source = self.client_address.client_ip_source,
+            trusted_proxy = self.client_address.trusted_proxy,
             cf_ray = self.cf_ray.as_deref().unwrap_or(""),
             duration_ms = self.started_at.elapsed().as_millis(),
             %reason,

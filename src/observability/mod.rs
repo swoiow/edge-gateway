@@ -4,7 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod runtime;
 
 pub(crate) use runtime::{
-    ActiveConnection, RelayDirection, RuntimeObservability, WebSocketCloseClass,
+    ActiveConnection, AdmissionRejection, RelayDirection, RuntimeObservability, WebSocketCloseClass,
 };
 
 pub(crate) fn init() -> Result<()> {

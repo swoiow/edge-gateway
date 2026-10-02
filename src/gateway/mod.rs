@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 pub(crate) mod body;
 mod h2_websocket;
 mod listener;
@@ -14,9 +15,12 @@ pub(crate) async fn run<F>(config: Config, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()>,
 {
-    let (server, tls, acme, observability, fallback, routes, grpc_routes) = config.into_parts();
+    let (server, routing, client_address, tls, acme, observability, fallback, routes, grpc_routes) =
+        config.into_parts();
     listener::run(
         server,
+        routing,
+        client_address,
         tls,
         acme,
         observability,
