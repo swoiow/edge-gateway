@@ -118,10 +118,10 @@ impl Http01Server {
 
     pub(super) async fn shutdown(mut self) {
         self.cancellation.cancel();
-        if let Some(task) = self.task.take() {
-            if let Err(error) = task.await {
-                warn!(error = %error, "ACME HTTP-01 listener task terminated unexpectedly");
-            }
+        if let Some(task) = self.task.take()
+            && let Err(error) = task.await
+        {
+            warn!(error = %error, "ACME HTTP-01 listener task terminated unexpectedly");
         }
     }
 }

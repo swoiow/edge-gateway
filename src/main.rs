@@ -1,8 +1,8 @@
 mod acme;
 mod config;
-mod fallback;
 mod gateway;
 mod grpc;
+mod http_proxy;
 mod observability;
 mod routes;
 mod routing;

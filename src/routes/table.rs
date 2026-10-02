@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use hyper::Uri;
 use hyper::header::HeaderValue;
+use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
 use crate::routing::normalize_dns_host;
+use crate::security::RouteSecurity;
 
 const MAX_ROUTE_ID_LENGTH: usize = 128;
 const MAX_ROUTE_PATH_LENGTH: usize = 2048;
@@ -21,6 +23,8 @@ pub(crate) struct RouteSpec {
     pub(crate) path: String,
     pub(crate) backend: String,
     pub(crate) enabled: bool,
+    pub(crate) security: RouteSecurity,
+    pub(crate) handshake: WebSocketHandshakeConfig,
 }
 
 pub(crate) struct RouteTable {
@@ -71,6 +75,8 @@ impl RouteTable {
                     path: Arc::from(spec.path),
                     namespace,
                     backend,
+                    security: spec.security,
+                    handshake: spec.handshake,
                 });
                 enabled_by_host.entry(host).or_default().insert(Arc::clone(&route.path), route);
                 enabled_count += 1;
@@ -103,9 +109,17 @@ pub(crate) struct Route {
     path: Arc<str>,
     namespace: RouteNamespace,
     backend: BackendEndpoint,
+    security: RouteSecurity,
+    handshake: WebSocketHandshakeConfig,
 }
 
 impl Route {
+    pub(crate) fn security(&self) -> RouteSecurity {
+        self.security
+    }
+    pub(crate) fn handshake(&self) -> WebSocketHandshakeConfig {
+        self.handshake
+    }
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
@@ -159,6 +173,12 @@ pub(crate) enum BackendEndpoint {
 
 impl BackendEndpoint {
     fn parse(value: &str) -> Result<Self, RouteError> {
+        if value.contains('#') {
+            return Err(RouteError::InvalidBackend {
+                backend: value.to_owned(),
+                reason: "fragment is not allowed".to_owned(),
+            });
+        }
         let uri = value.parse::<Uri>().map_err(|source| RouteError::InvalidBackend {
             backend: value.to_owned(),
             reason: source.to_string(),
@@ -310,10 +330,14 @@ fn parse_loopback_authority<'a>(
         backend: value.to_owned(),
         reason: "host is required".to_owned(),
     })?;
-    let ip = host.parse::<IpAddr>().map_err(|_| RouteError::InvalidBackend {
-        backend: value.to_owned(),
-        reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
-    })?;
+    let ip =
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .map_err(|_| RouteError::InvalidBackend {
+                backend: value.to_owned(),
+                reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
+            })?;
     if !ip.is_loopback() {
         return Err(RouteError::InvalidBackend {
             backend: value.to_owned(),
@@ -335,6 +359,12 @@ fn parse_loopback_authority<'a>(
         })?,
     };
 
+    if port == 0 {
+        return Err(RouteError::InvalidBackend {
+            backend: value.to_owned(),
+            reason: "port must not be zero".to_owned(),
+        });
+    }
     Ok((SocketAddr::new(ip, port), authority.as_str()))
 }
 
@@ -480,4 +510,28 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WebSocketHandshakeConfig {
+    pub(crate) forward_cookie: bool,
+    pub(crate) forward_origin: bool,
+    pub(crate) query: WebSocketQuery,
+}
+impl Default for WebSocketHandshakeConfig {
+    fn default() -> Self {
+        Self {
+            forward_cookie: true,
+            forward_origin: true,
+            query: WebSocketQuery::Backend,
+        }
+    }
+}
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WebSocketQuery {
+    #[default]
+    Backend,
+    Preserve,
 }

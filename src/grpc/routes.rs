@@ -7,6 +7,7 @@ use hyper::header::HeaderValue;
 use thiserror::Error;
 
 use crate::routing::normalize_dns_host;
+use crate::security::RouteSecurity;
 
 const MAX_ROUTE_ID_LENGTH: usize = 128;
 const MAX_GRPC_PATH_LENGTH: usize = 2048;
@@ -17,6 +18,7 @@ pub(crate) struct GrpcRouteSpec {
     pub(crate) path: String,
     pub(crate) backend: String,
     pub(crate) enabled: bool,
+    pub(crate) security: RouteSecurity,
 }
 
 pub(crate) struct GrpcRouteTable {
@@ -68,6 +70,7 @@ impl GrpcRouteTable {
                     path: Arc::from(spec.path),
                     backend,
                     upstream_uri,
+                    security: spec.security,
                 });
                 enabled_by_host.entry(host).or_default().insert(Arc::clone(&route.path), route);
                 enabled_count += 1;
@@ -104,9 +107,13 @@ pub(crate) struct GrpcRoute {
     path: Arc<str>,
     backend: GrpcBackendEndpoint,
     upstream_uri: Uri,
+    security: RouteSecurity,
 }
 
 impl GrpcRoute {
+    pub(crate) fn security(&self) -> RouteSecurity {
+        self.security
+    }
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
@@ -166,10 +173,14 @@ impl GrpcBackendEndpoint {
             backend: value.to_owned(),
             reason: "host is required".to_owned(),
         })?;
-        let ip = host.parse::<IpAddr>().map_err(|_| GrpcRouteError::InvalidBackend {
-            backend: value.to_owned(),
-            reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
-        })?;
+        let ip =
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .map_err(|_| GrpcRouteError::InvalidBackend {
+                    backend: value.to_owned(),
+                    reason: "host must be an IPv4 or IPv6 loopback address".to_owned(),
+                })?;
 
         if !ip.is_loopback() {
             return Err(GrpcRouteError::InvalidBackend {
@@ -178,9 +189,11 @@ impl GrpcBackendEndpoint {
             });
         }
 
-        let port = uri.port_u16().ok_or_else(|| GrpcRouteError::InvalidBackend {
-            backend: value.to_owned(),
-            reason: "an explicit port is required".to_owned(),
+        let port = uri.port_u16().filter(|port| *port != 0).ok_or_else(|| {
+            GrpcRouteError::InvalidBackend {
+                backend: value.to_owned(),
+                reason: "an explicit nonzero port is required".to_owned(),
+            }
         })?;
         let request_target = uri.path_and_query().map(|value| value.as_str()).unwrap_or("/");
         if request_target != "/" {

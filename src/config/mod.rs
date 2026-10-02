@@ -6,12 +6,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 
 use crate::grpc::{GrpcRouteError, GrpcRouteSpec, GrpcRouteTable};
+use crate::http_proxy::config::{FileHttpProxyConfig, FileUpstreamConfig, UpstreamConfig};
+use crate::http_proxy::routes::{FileHttpRouteConfig, HttpRouteTable};
+use crate::routes::table::WebSocketHandshakeConfig;
 use crate::routes::{RouteError, RouteSpec, RouteTable};
 use crate::routing::{RoutingPolicy, normalize_dns_host};
-use crate::security::{ClientAddressPolicy, ClientIpMode, IpNetwork};
+use crate::security::{ClientAddressPolicy, CloudflareNetworks, IpNetwork, RouteSecurity};
 
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_WEBSOCKET_UPGRADE_TIMEOUT_SECONDS: u64 = 10;
@@ -42,6 +44,8 @@ pub(crate) struct Config {
     fallback: Option<FallbackConfig>,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
+    http_routes: Arc<HttpRouteTable>,
+    max_http_upstream_connections: usize,
 }
 
 impl Config {
@@ -72,6 +76,8 @@ impl Config {
         Option<FallbackConfig>,
         Arc<RouteTable>,
         Arc<GrpcRouteTable>,
+        Arc<HttpRouteTable>,
+        usize,
     ) {
         (
             self.server,
@@ -83,6 +89,8 @@ impl Config {
             self.fallback,
             self.routes,
             self.grpc_routes,
+            self.http_routes,
+            self.max_http_upstream_connections,
         )
     }
 }
@@ -167,60 +175,24 @@ impl ServerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FallbackScheme {
-    Http,
-    Https,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FallbackTlsServerName {
-    RequestHost,
-    Literal(String),
-}
-
 #[derive(Clone)]
 pub(crate) struct FallbackConfig {
-    backend: String,
     hosts: HashSet<String>,
-    scheme: FallbackScheme,
-    address: SocketAddr,
-    preserve_host: bool,
-    tls_server_name: FallbackTlsServerName,
-    ca_file: Option<PathBuf>,
+    security: RouteSecurity,
+    upstream: UpstreamConfig,
 }
-
 impl FallbackConfig {
     pub(crate) fn permits_host(&self, host: &str) -> bool {
         self.hosts.contains(host)
     }
-
     pub(crate) fn hosts(&self) -> impl Iterator<Item = &String> {
         self.hosts.iter()
     }
-
-    pub(crate) fn backend(&self) -> &str {
-        &self.backend
+    pub(crate) fn security(&self) -> RouteSecurity {
+        self.security
     }
-
-    pub(crate) const fn scheme(&self) -> FallbackScheme {
-        self.scheme
-    }
-
-    pub(crate) const fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    pub(crate) const fn preserve_host(&self) -> bool {
-        self.preserve_host
-    }
-
-    pub(crate) fn tls_server_name(&self) -> &FallbackTlsServerName {
-        &self.tls_server_name
-    }
-
-    pub(crate) fn ca_file(&self) -> Option<&Path> {
-        self.ca_file.as_deref()
+    pub(crate) fn upstream(&self) -> &UpstreamConfig {
+        &self.upstream
     }
 }
 
@@ -407,7 +379,10 @@ impl ObservabilityConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    client_ip: FileClientIpConfig,
+    #[serde(default)]
+    security: FileSecurityConfig,
+    #[serde(default)]
+    http_proxy: FileHttpProxyConfig,
     #[serde(default)]
     routing: FileRoutingConfig,
     server: FileServerConfig,
@@ -422,6 +397,8 @@ struct FileConfig {
     routes: Vec<FileRouteConfig>,
     #[serde(default)]
     grpc_routes: Vec<FileGrpcRouteConfig>,
+    #[serde(default)]
+    http_routes: Vec<FileHttpRouteConfig>,
 }
 
 impl FileConfig {
@@ -457,7 +434,30 @@ impl FileConfig {
             MAX_GRPC_CONCURRENT_STREAMS_PER_BACKEND,
         )?;
 
-        let client_address = Arc::new(self.client_ip.validate(config_directory).await?);
+        let needs_cloudflare =
+            self.routes.iter().any(|route| route.enabled && route.security.cloudflare_only)
+                || self
+                    .grpc_routes
+                    .iter()
+                    .any(|route| route.enabled && route.security.cloudflare_only)
+                || self
+                    .http_routes
+                    .iter()
+                    .any(|route| route.enabled && route.security.cloudflare_only)
+                || self
+                    .fallback
+                    .as_ref()
+                    .is_some_and(|fallback| fallback.enabled && fallback.security.cloudflare_only);
+        if self.routes.len() + self.grpc_routes.len() + self.http_routes.len() > 4096 {
+            return Err(ConfigError::Invalid(
+                "total configured routes must not exceed 4096".to_owned(),
+            ));
+        }
+        let max_http_upstream_connections = validate_count(
+            "http_proxy.max_connections",
+            self.http_proxy.max_connections,
+            1000000,
+        )?;
         let max_connections = validate_count(
             "server.max_connections",
             self.server.max_connections,
@@ -537,6 +537,8 @@ impl FileConfig {
                 path: route.path,
                 backend: route.backend,
                 enabled: route.enabled,
+                security: route.security,
+                handshake: route.handshake,
             })
             .collect();
         let mut hosts = HashSet::new();
@@ -547,6 +549,8 @@ impl FileConfig {
                     "WebSocket routes must not use reserved health paths".to_owned(),
                 ));
             }
+            crate::http_proxy::routes::validate_http_path(&route.path)
+                .map_err(|reason| ConfigError::Invalid(format!("routes.path: {reason}")))?;
             let host = normalize_dns_host(&route.host)
                 .map_err(|reason| ConfigError::Invalid(format!("routes.host: {reason}")))?;
             websocket_paths.insert((host.clone(), route.path.clone()));
@@ -565,6 +569,7 @@ impl FileConfig {
                 path: route.path,
                 backend: route.backend,
                 enabled: route.enabled,
+                security: route.security,
             })
             .collect();
         for route in &grpc_route_specs {
@@ -576,11 +581,17 @@ impl FileConfig {
                     route.path
                 )));
             }
+            websocket_paths.insert((host.clone(), route.path.clone()));
             if route.enabled {
                 hosts.insert(host);
             }
         }
         let grpc_routes = Arc::new(GrpcRouteTable::build(grpc_route_specs)?);
+        let http_routes = Arc::new(
+            HttpRouteTable::build(self.http_routes, config_directory, &websocket_paths)
+                .map_err(ConfigError::Invalid)?,
+        );
+        hosts.extend(http_routes.hosts().cloned());
         if let Some(fallback) = &fallback {
             hosts.extend(fallback.hosts().cloned());
         }
@@ -589,6 +600,8 @@ impl FileConfig {
             RoutingPolicy::build(hosts, self.routing.require_sni, bindings)
                 .map_err(ConfigError::Invalid)?,
         );
+        let client_address =
+            Arc::new(self.security.validate(config_directory, needs_cloudflare).await?);
 
         Ok(Config {
             server: ServerConfig {
@@ -616,6 +629,8 @@ impl FileConfig {
             fallback,
             routes,
             grpc_routes,
+            http_routes,
+            max_http_upstream_connections,
         })
     }
 }
@@ -742,12 +757,12 @@ impl FileAcmeConfig {
                 "acme.email is required when ACME is enabled".to_owned(),
             ));
         }
-        if let Some(value) = email.as_deref() {
-            if value.contains(char::is_whitespace) || !value.contains('@') {
-                return Err(ConfigError::Invalid(
-                    "acme.email must be a plain email address".to_owned(),
-                ));
-            }
+        if let Some(value) = email.as_deref()
+            && (value.contains(char::is_whitespace) || !value.contains('@'))
+        {
+            return Err(ConfigError::Invalid(
+                "acme.email must be a plain email address".to_owned(),
+            ));
         }
         if self.enabled && self.certificates.is_empty() {
             return Err(ConfigError::Invalid(
@@ -905,24 +920,15 @@ struct FileFallbackConfig {
     hosts: Vec<String>,
     #[serde(default)]
     enabled: bool,
-    backend: String,
-    #[serde(default = "default_fallback_preserve_host")]
-    preserve_host: bool,
-    #[serde(default = "default_fallback_tls_server_name")]
-    tls_server_name: String,
     #[serde(default)]
-    ca_file: Option<PathBuf>,
+    security: RouteSecurity,
+    upstream: FileUpstreamConfig,
 }
-
 impl FileFallbackConfig {
-    fn validate(self, config_directory: &Path) -> Result<Option<FallbackConfig>, ConfigError> {
-        if !self.enabled {
-            return Ok(None);
-        }
-
-        if self.hosts.is_empty() {
+    fn validate(self, directory: &Path) -> Result<Option<FallbackConfig>, ConfigError> {
+        if self.hosts.is_empty() || self.hosts.len() > 1024 {
             return Err(ConfigError::Invalid(
-                "fallback.hosts must not be empty".to_owned(),
+                "fallback.hosts must contain 1..1024 names".to_owned(),
             ));
         }
         let mut hosts = HashSet::new();
@@ -935,81 +941,14 @@ impl FileFallbackConfig {
                 )));
             }
         }
-        let uri = self.backend.parse::<hyper::Uri>().map_err(|source| {
-            ConfigError::Invalid(format!(
-                "invalid fallback.backend {:?}: {source}",
-                self.backend
-            ))
-        })?;
-        let scheme = match uri.scheme_str() {
-            Some("http") => FallbackScheme::Http,
-            Some("https") => FallbackScheme::Https,
-            _ => {
-                return Err(ConfigError::Invalid(
-                    "fallback.backend scheme must be http or https".to_owned(),
-                ));
-            }
-        };
-        let authority = uri.authority().ok_or_else(|| {
-            ConfigError::Invalid("fallback.backend authority is required".to_owned())
-        })?;
-        if authority.as_str().contains('@') {
-            return Err(ConfigError::Invalid(
-                "fallback.backend userinfo is not allowed".to_owned(),
-            ));
-        }
-        let host = uri
-            .host()
-            .ok_or_else(|| ConfigError::Invalid("fallback.backend host is required".to_owned()))?;
-        let ip = host.parse::<IpAddr>().map_err(|_| {
-            ConfigError::Invalid(
-                "fallback.backend host must be an IPv4 or IPv6 loopback address".to_owned(),
-            )
-        })?;
-        if !ip.is_loopback() {
-            return Err(ConfigError::Invalid(
-                "fallback.backend host must be a loopback address".to_owned(),
-            ));
-        }
-        let port = uri.port_u16().ok_or_else(|| {
-            ConfigError::Invalid("fallback.backend must include an explicit port".to_owned())
-        })?;
-        if uri.path_and_query().map(|value| value.as_str()).unwrap_or("/") != "/" {
-            return Err(ConfigError::Invalid(
-                "fallback.backend must not contain a path or query".to_owned(),
-            ));
-        }
-
-        let tls_server_name = if self.tls_server_name == "request_host" {
-            FallbackTlsServerName::RequestHost
-        } else {
-            let name = normalize_tls_server_name(&self.tls_server_name).map_err(|reason| {
-                ConfigError::Invalid(format!(
-                    "invalid fallback.tls_server_name {:?}: {reason}",
-                    self.tls_server_name
-                ))
-            })?;
-            FallbackTlsServerName::Literal(name)
-        };
-
-        if let Some(path) = self.ca_file.as_deref() {
-            validate_path("fallback.ca_file", path)?;
-        }
-        let ca_file = self.ca_file.map(|path| resolve_config_path(config_directory, path));
-        if scheme == FallbackScheme::Http && ca_file.is_some() {
-            return Err(ConfigError::Invalid(
-                "fallback.ca_file is only valid for an https backend".to_owned(),
-            ));
-        }
-
-        Ok(Some(FallbackConfig {
-            backend: self.backend,
+        let upstream = self
+            .upstream
+            .validate(directory)
+            .map_err(|reason| ConfigError::Invalid(format!("fallback: {reason}")))?;
+        Ok(self.enabled.then_some(FallbackConfig {
             hosts,
-            scheme,
-            address: SocketAddr::new(ip, port),
-            preserve_host: self.preserve_host,
-            tls_server_name,
-            ca_file,
+            security: self.security,
+            upstream,
         }))
     }
 }
@@ -1017,6 +956,10 @@ impl FileFallbackConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileRouteConfig {
+    #[serde(default)]
+    security: RouteSecurity,
+    #[serde(default)]
+    handshake: WebSocketHandshakeConfig,
     id: String,
     host: String,
     path: String,
@@ -1028,6 +971,8 @@ struct FileRouteConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileGrpcRouteConfig {
+    #[serde(default)]
+    security: RouteSecurity,
     id: String,
     host: String,
     path: String,
@@ -1170,31 +1115,6 @@ fn normalize_domain(domain: &str) -> Result<String, &'static str> {
     Ok(domain)
 }
 
-fn normalize_tls_server_name(name: &str) -> Result<String, &'static str> {
-    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
-    if name.is_empty() {
-        return Err("name must not be empty");
-    }
-    if name.len() > 253 || !name.is_ascii() {
-        return Err("name must be an ASCII DNS name no longer than 253 characters");
-    }
-    if name.parse::<IpAddr>().is_ok() {
-        return Err("an IP address is not valid for TLS server-name verification");
-    }
-    for label in name.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err("DNS labels must contain between 1 and 63 characters");
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err("DNS labels must not start or end with '-'");
-        }
-        if !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
-            return Err("DNS labels may contain only ASCII letters, digits and '-'");
-        }
-    }
-    Ok(name)
-}
-
 fn resolve_config_path(config_directory: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -1251,14 +1171,6 @@ const fn default_acme_check_interval_hours() -> u64 {
     DEFAULT_ACME_CHECK_INTERVAL_HOURS
 }
 
-const fn default_fallback_preserve_host() -> bool {
-    true
-}
-
-fn default_fallback_tls_server_name() -> String {
-    "request_host".to_owned()
-}
-
 const fn default_route_enabled() -> bool {
     true
 }
@@ -1268,8 +1180,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        FallbackScheme, FallbackTlsServerName, FileFallbackConfig, FileTlsConfig, normalize_domain,
+        FileFallbackConfig, FileTlsConfig, FileUpstreamConfig, RouteSecurity, normalize_domain,
     };
+    use crate::http_proxy::config::{HostHeaderPolicy, TlsServerName};
 
     #[test]
     fn acme_domain_normalization_rejects_wildcards() {
@@ -1286,20 +1199,25 @@ mod tests {
         let result = FileFallbackConfig {
             enabled: true,
             hosts: vec!["api.example.com".to_owned()],
-            backend: "https://127.0.0.1:9443".to_owned(),
-            preserve_host: true,
-            tls_server_name: "request_host".to_owned(),
-            ca_file: None,
+            security: RouteSecurity::default(),
+            upstream: FileUpstreamConfig {
+                endpoint: "https://127.0.0.1:9443".to_owned(),
+                protocol: Default::default(),
+                host_header: HostHeaderPolicy::Preserve,
+                tls_server_name: "request_host".to_owned(),
+                ca_file: None,
+                pool: Default::default(),
+            },
         }
         .validate(Path::new("."));
 
         assert!(matches!(&result, Ok(Some(_))));
         if let Ok(Some(config)) = result {
-            assert_eq!(config.scheme(), FallbackScheme::Https);
-            assert!(config.preserve_host());
+            assert!(config.upstream().tls);
+            assert!(config.upstream().host_header == HostHeaderPolicy::Preserve);
             assert_eq!(
-                config.tls_server_name(),
-                &FallbackTlsServerName::RequestHost
+                &config.upstream().tls_server_name,
+                &TlsServerName::RequestHost
             );
         }
     }
@@ -1309,10 +1227,15 @@ mod tests {
         let result = FileFallbackConfig {
             enabled: true,
             hosts: vec!["api.example.com".to_owned()],
-            backend: "https://192.0.2.10:9443".to_owned(),
-            preserve_host: true,
-            tls_server_name: "request_host".to_owned(),
-            ca_file: None,
+            security: RouteSecurity::default(),
+            upstream: FileUpstreamConfig {
+                endpoint: "https://192.0.2.10:9443".to_owned(),
+                protocol: Default::default(),
+                host_header: HostHeaderPolicy::Preserve,
+                tls_server_name: "request_host".to_owned(),
+                ca_file: None,
+                pool: Default::default(),
+            },
         }
         .validate(Path::new("."));
         assert!(result.is_err());
@@ -1390,22 +1313,44 @@ struct FileSniBinding {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileClientIpConfig {
-    mode: ClientIpMode,
-    #[serde(default)]
-    trusted_proxy_cidrs_file: Option<PathBuf>,
+#[serde(default, deny_unknown_fields)]
+struct FileSecurityConfig {
     #[serde(default = "default_health_peer_cidrs")]
     health_peer_cidrs: Vec<String>,
+    cloudflare: Option<FileCloudflareConfig>,
+}
+impl Default for FileSecurityConfig {
+    fn default() -> Self {
+        Self {
+            health_peer_cidrs: default_health_peer_cidrs(),
+            cloudflare: None,
+        }
+    }
 }
 fn default_health_peer_cidrs() -> Vec<String> {
     vec!["127.0.0.0/8".to_owned(), "::1/128".to_owned()]
 }
-impl FileClientIpConfig {
-    async fn validate(self, directory: &Path) -> Result<ClientAddressPolicy, ConfigError> {
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileCloudflareConfig {
+    cache_file: PathBuf,
+}
+impl Default for FileCloudflareConfig {
+    fn default() -> Self {
+        Self {
+            cache_file: PathBuf::from("state/cloudflare-cidrs.txt"),
+        }
+    }
+}
+impl FileSecurityConfig {
+    async fn validate(
+        self,
+        directory: &Path,
+        needs_cloudflare: bool,
+    ) -> Result<ClientAddressPolicy, ConfigError> {
         if self.health_peer_cidrs.len() > 128 {
             return Err(ConfigError::Invalid(
-                "client_ip.health_peer_cidrs exceeds 128 entries".to_owned(),
+                "security.health_peer_cidrs exceeds 128 entries".to_owned(),
             ));
         }
         let health = self
@@ -1413,72 +1358,20 @@ impl FileClientIpConfig {
             .iter()
             .map(|value| {
                 IpNetwork::parse(value).map_err(|reason| {
-                    ConfigError::Invalid(format!("client_ip.health_peer_cidrs {value:?}: {reason}"))
+                    ConfigError::Invalid(format!("security.health_peer_cidrs {value:?}: {reason}"))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut trusted = Vec::new();
-        match (self.mode, self.trusted_proxy_cidrs_file) {
-            (ClientIpMode::Cloudflare, Some(path)) => {
-                validate_path("client_ip.trusted_proxy_cidrs_file", &path)?;
-                let path = resolve_config_path(directory, path);
-                let file =
-                    tokio::fs::File::open(&path).await.map_err(|source| ConfigError::Read {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let mut data = String::new();
-                file.take(262145).read_to_string(&mut data).await.map_err(|source| {
-                    ConfigError::Read {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
-                if data.len() > 262144 {
-                    return Err(ConfigError::Invalid(
-                        "trusted proxy CIDR file exceeds 256 KiB".to_owned(),
-                    ));
-                }
-                let mut seen = HashSet::new();
-                for (line, value) in data.lines().enumerate() {
-                    let value = value.split('#').next().unwrap_or("").trim();
-                    if value.is_empty() {
-                        continue;
-                    }
-                    if !seen.insert(value.to_owned()) {
-                        return Err(ConfigError::Invalid(format!(
-                            "duplicate trusted CIDR at line {}",
-                            line + 1
-                        )));
-                    }
-                    let network = IpNetwork::parse(value).map_err(|reason| {
-                        ConfigError::Invalid(format!("{}:{}: {reason}", path.display(), line + 1))
-                    })?;
-                    trusted.push(network);
-                    if trusted.len() > 4096 {
-                        return Err(ConfigError::Invalid(
-                            "trusted proxy CIDR file exceeds 4096 entries".to_owned(),
-                        ));
-                    }
-                }
-                if trusted.is_empty() {
-                    return Err(ConfigError::Invalid(
-                        "trusted proxy CIDR file is empty".to_owned(),
-                    ));
-                }
-            }
-            (ClientIpMode::Cloudflare, None) => {
-                return Err(ConfigError::Invalid(
-                    "cloudflare mode requires client_ip.trusted_proxy_cidrs_file".to_owned(),
-                ));
-            }
-            (ClientIpMode::Direct, Some(_)) => {
-                return Err(ConfigError::Invalid(
-                    "direct mode must not configure trusted_proxy_cidrs_file".to_owned(),
-                ));
-            }
-            (ClientIpMode::Direct, None) => {}
-        }
-        Ok(ClientAddressPolicy::new(self.mode, trusted, health))
+        let cache_file = if needs_cloudflare || self.cloudflare.is_some() {
+            let config = self.cloudflare.unwrap_or_default();
+            validate_path("security.cloudflare.cache_file", &config.cache_file)?;
+            Some(resolve_config_path(directory, config.cache_file))
+        } else {
+            None
+        };
+        let networks = CloudflareNetworks::load(cache_file)
+            .await
+            .map_err(|error| ConfigError::Invalid(format!("security.cloudflare: {error:#}")))?;
+        Ok(ClientAddressPolicy::new(networks, health))
     }
 }

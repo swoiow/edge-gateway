@@ -23,11 +23,12 @@ use tracing::{debug, info, warn};
 
 use crate::acme::{AcmeManager, AcmeRuntime};
 use crate::config::{AcmeConfig, FallbackConfig, ObservabilityConfig, ServerConfig, TlsConfig};
-use crate::fallback::FallbackRuntime;
 use crate::gateway::admission::RequestLease;
 use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::websocket::WebSocketRuntime;
 use crate::grpc::{GrpcRouteTable, GrpcRuntime};
+use crate::http_proxy::routes::validate_http_path;
+use crate::http_proxy::{HttpProxyRuntime, HttpRouteTable};
 use crate::observability::{ActiveConnection, AdmissionRejection, RuntimeObservability};
 use crate::routes::RouteTable;
 use crate::routing::{RoutingPolicy, resolve_request_host};
@@ -44,6 +45,8 @@ pub(super) async fn run<F>(
     fallback_config: Option<FallbackConfig>,
     routes: Arc<RouteTable>,
     grpc_routes: Arc<GrpcRouteTable>,
+    http_routes: Arc<HttpRouteTable>,
+    max_http_upstream_connections: usize,
     shutdown_signal: F,
 ) -> Result<()>
 where
@@ -105,17 +108,15 @@ where
         cancellation.child_token(),
         observability.clone(),
     );
-    let fallback_runtime = match fallback_config {
-        Some(config) => Some(
-            FallbackRuntime::new(
-                config,
-                server_config.backend_connect_timeout(),
-                cancellation.child_token(),
-            )
-            .await?,
-        ),
-        None => None,
-    };
+    let http_runtime = HttpProxyRuntime::new(
+        &http_routes,
+        fallback_config.as_ref(),
+        max_http_upstream_connections,
+        server_config.backend_connect_timeout(),
+        cancellation.child_token(),
+    )
+    .await?;
+    let client_address_task = client_address.start(cancellation.child_token());
     let transport_capacity = Arc::new(Semaphore::new(server_config.max_connections()));
     let handshake_capacity = Arc::new(Semaphore::new(
         server_config.max_concurrent_tls_handshakes(),
@@ -130,7 +131,9 @@ where
         routes: Arc::clone(&routes),
         websocket: websocket_runtime.clone(),
         grpc: grpc_runtime.clone(),
-        fallback: fallback_runtime.clone(),
+        fallback: fallback_config.clone(),
+        http_routes: Arc::clone(&http_routes),
+        http: http_runtime.clone(),
     };
     let acme_runtime = acme_manager
         .take()
@@ -144,7 +147,9 @@ where
         enabled_grpc_routes = grpc_runtime.enabled_route_count(),
         tls_certificates = certificate_store.certificate_count(),
         acme_enabled = acme_config.enabled(),
-        fallback_enabled = fallback_runtime.is_some(),
+        fallback_enabled = fallback_config.is_some(),
+        configured_http_routes = http_routes.configured_count(),
+        enabled_http_routes = http_routes.enabled_count(),
         "gateway listener started"
     );
 
@@ -166,10 +171,6 @@ where
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("failed to accept TCP connection")?;
-                if !service_state.client_address.permits_transport_peer(peer) {
-                    log_admission_rejection(&observability, AdmissionRejection::OriginPeer, peer);
-                    continue;
-                }
                 let transport_permit = match Arc::clone(&transport_capacity).try_acquire_owned() {
                     Ok(permit) => Arc::new(permit),
                     Err(_) => { log_admission_rejection(&observability, AdmissionRejection::ConnectionCapacity, peer); continue; }
@@ -210,9 +211,7 @@ where
     cancellation.cancel();
     websocket_runtime.close();
     grpc_runtime.close();
-    if let Some(runtime) = &fallback_runtime {
-        runtime.close();
-    }
+    http_runtime.close();
 
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
@@ -221,12 +220,11 @@ where
     }
 
     let data_plane_shutdown = async {
-        let fallback_wait = async {
-            if let Some(runtime) = &fallback_runtime {
-                runtime.wait().await;
-            }
-        };
-        tokio::join!(websocket_runtime.wait(), grpc_runtime.wait(), fallback_wait);
+        tokio::join!(
+            websocket_runtime.wait(),
+            grpc_runtime.wait(),
+            http_runtime.wait()
+        );
     };
     if timeout(server_config.shutdown_grace(), data_plane_shutdown).await.is_err() {
         warn!(
@@ -239,6 +237,9 @@ where
         runtime.wait().await;
     }
 
+    if let Err(error) = client_address_task.await {
+        warn!(%error, "CF maintenance task terminated unexpectedly");
+    }
     observability_shutdown.cancel();
     observability_task.wait().await;
     info!("gateway shutdown complete");
@@ -255,7 +256,9 @@ struct ServiceState {
     routes: Arc<RouteTable>,
     websocket: WebSocketRuntime,
     grpc: GrpcRuntime,
-    fallback: Option<FallbackRuntime>,
+    fallback: Option<FallbackConfig>,
+    http_routes: Arc<HttpRouteTable>,
+    http: HttpProxyRuntime,
 }
 
 struct ConnectionParameters {
@@ -485,18 +488,6 @@ async fn handle_request(
             "headers too large\n",
         ));
     }
-    let client_address =
-        match state.client_address.resolve_trusted_client_address(peer, request.headers()) {
-            Ok(address) => address,
-            Err(_) => {
-                log_admission_rejection(
-                    &state.observability,
-                    AdmissionRejection::ClientIdentity,
-                    peer,
-                );
-                return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
-            }
-        };
     let host = match resolve_request_host(&request) {
         Ok(host) => host,
         Err(_) => {
@@ -514,6 +505,46 @@ async fn handle_request(
             "misdirected request\n",
         ));
     }
+    if validate_http_path(request.uri().path()).is_err() {
+        return Ok(text_response(StatusCode::BAD_REQUEST, "invalid path\n"));
+    }
+    // Select the route before applying its origin policy, on every H2 stream.
+    let path = request.uri().path();
+    let websocket_route = state.routes.resolve(&host, path);
+    let grpc_route = if websocket_route.is_none() {
+        state.grpc.resolve(&host, path)
+    } else {
+        None
+    };
+    let http_route = if websocket_route.is_none() && grpc_route.is_none() {
+        state.http_routes.resolve(&host, path)
+    } else {
+        None
+    };
+    let fallback = state.fallback.as_ref().filter(|fallback| fallback.permits_host(&host));
+    let security = if let Some(route) = &websocket_route {
+        route.security()
+    } else if let Some(route) = &grpc_route {
+        route.security()
+    } else if let Some(route) = &http_route {
+        route.security
+    } else if let Some(fallback) = fallback {
+        fallback.security()
+    } else {
+        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
+    };
+    let client_address =
+        match state.client_address.resolve_client_address(peer, request.headers(), security) {
+            Ok(address) => address,
+            Err(_) => {
+                log_admission_rejection(
+                    &state.observability,
+                    AdmissionRejection::ClientIdentity,
+                    peer,
+                );
+                return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
+            }
+        };
     let request_permit = match Arc::clone(&state.request_capacity).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -547,8 +578,7 @@ async fn handle_request(
     request.extensions_mut().insert(Arc::clone(&admission));
     crate::security::sanitize_client_address_headers(request.headers_mut(), client_address);
 
-    let path = request.uri().path();
-    let response = if let Some(route) = state.routes.resolve(&host, path) {
+    let response = if let Some(route) = websocket_route {
         match state
             .websocket
             .accept(
@@ -573,21 +603,12 @@ async fn handle_request(
                 response
             }
         }
-    } else if let Some(route) = state.grpc.resolve(&host, path) {
+    } else if let Some(route) = grpc_route {
         state.grpc.proxy(request, route, client_address, transport_connection_id).await
-    } else if let Some(fallback) = &state.fallback {
-        if fallback.permits_host(&host) {
-            fallback
-                .proxy(
-                    request,
-                    peer,
-                    transport_connection_id,
-                    downstream_sni.as_deref(),
-                )
-                .await
-        } else {
-            text_response(StatusCode::NOT_FOUND, "not found\n")
-        }
+    } else if let Some(route) = http_route {
+        state.http.proxy_route(request, route, client_address).await
+    } else if fallback.is_some() {
+        state.http.proxy_fallback(request, &host, client_address).await
     } else {
         text_response(StatusCode::NOT_FOUND, "not found\n")
     };

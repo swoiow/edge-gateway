@@ -1,5 +1,5 @@
 [server]
-listen = "0.0.0.0:8443"
+listen = "127.0.0.1:8443"
 tls_handshake_timeout_seconds = 10
 websocket_upgrade_timeout_seconds = 10
 backend_connect_timeout_seconds = 3
@@ -31,7 +31,7 @@ require_sni = true
 
 [client_ip]
 mode = "cloudflare"
-trusted_proxy_cidrs_file = "config/cloudflare-origin-cidrs.txt"
+trusted_proxy_cidrs_file = "config/loopback-trusted-proxy.dev.txt"
 # These peers may connect for GET /health/live|ready only. They do not become
 # trusted proxies and cannot access business routes in cloudflare mode.
 health_peer_cidrs = ["127.0.0.0/8", "::1/128"]

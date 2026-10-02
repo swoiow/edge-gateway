@@ -746,11 +746,11 @@ fn observe_progress(
             context.observability.record_websocket_idle_event();
             tracker.idle_episode_reported = true;
         }
-    } else if upstream.stage.is_write_path() || downstream.stage.is_write_path() {
-        if !tracker.no_progress_episode_reported {
-            context.observability.record_websocket_no_progress_event();
-            tracker.no_progress_episode_reported = true;
-        }
+    } else if (upstream.stage.is_write_path() || downstream.stage.is_write_path())
+        && !tracker.no_progress_episode_reported
+    {
+        context.observability.record_websocket_no_progress_event();
+        tracker.no_progress_episode_reported = true;
     }
 
     if context.observability.connection_event_logs_enabled() {

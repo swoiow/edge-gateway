@@ -27,6 +27,7 @@ use crate::gateway::body::{self, ResponseBody};
 use crate::gateway::h2_websocket::split_extended_connect_body;
 use crate::gateway::relay::{self, ConnectionContext, RelaySocket};
 use crate::observability::RuntimeObservability;
+use crate::routes::table::WebSocketQuery;
 use crate::routes::{BackendKind, Route, RouteNamespace};
 use crate::security::ResolvedClientAddress;
 
@@ -82,7 +83,7 @@ impl WebSocketRuntime {
         }
 
         let handshake_kind = validate_downstream_handshake(&request)?;
-        let backend_headers = BackendHandshakeHeaders::from_downstream(&request)?;
+        let backend_headers = BackendHandshakeHeaders::from_downstream(&request, &route)?;
         let connection_id = self.observability.next_websocket_connection_id();
         let downstream_http_version = http_version(request.version());
         let cf_ray = request
@@ -188,12 +189,16 @@ impl WebSocketRuntime {
             "WebSocket backend connected"
         );
         let selected_subprotocol = backend.selected_subprotocol().cloned();
+        let response_cookies = backend.response_cookies().to_vec();
 
         match handshake_kind {
             DownstreamHandshake::Http1Upgrade => {
                 let Some((mut response, downstream_upgrade)) = h1_upgrade else {
                     return Err(AcceptError::InvalidInternalState);
                 };
+                for cookie in &response_cookies {
+                    response.headers_mut().append("set-cookie", cookie.clone());
+                }
                 if let Some(protocol) = selected_subprotocol {
                     response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
                 }
@@ -245,6 +250,9 @@ impl WebSocketRuntime {
 
                 let mut response = Response::new(body::boxed(response_body));
                 *response.status_mut() = StatusCode::OK;
+                for cookie in &response_cookies {
+                    response.headers_mut().append("set-cookie", cookie.clone());
+                }
                 if let Some(protocol) = selected_subprotocol {
                     response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
                 }
@@ -560,9 +568,20 @@ async fn connect_websocket_backend(
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for WebSocket backend")?;
 
+    let target = if route.handshake().query == WebSocketQuery::Preserve {
+        let path = endpoint.request_target().path();
+        match &headers.query {
+            Some(query) => format!("{path}?{query}"),
+            None => path.to_owned(),
+        }
+        .parse::<hyper::Uri>()
+        .context("invalid WS upstream target")?
+    } else {
+        endpoint.request_target().clone()
+    };
     let mut request = Request::builder()
         .method(Method::GET)
-        .uri(endpoint.request_target().clone())
+        .uri(target)
         .header(HOST, endpoint.host_header().clone())
         .header(UPGRADE, "websocket")
         .header(CONNECTION, "upgrade")
@@ -593,6 +612,9 @@ async fn connect_websocket_backend(
     if let Some(authorization) = &headers.authorization {
         request.headers_mut().insert(AUTHORIZATION, authorization.clone());
     }
+    for (name, value) in &headers.application {
+        request.headers_mut().append(name, value.clone());
+    }
     for protocol in &headers.websocket_protocols {
         request.headers_mut().append(SEC_WEBSOCKET_PROTOCOL, protocol.clone());
     }
@@ -602,9 +624,11 @@ async fn connect_websocket_backend(
         .context("WebSocket backend handshake failed")?;
     let selected_subprotocol =
         validate_backend_subprotocol(response.headers(), &headers.websocket_protocols)?;
+    let response_cookies = response.headers().get_all("set-cookie").iter().cloned().collect();
     Ok(BackendConnection::WebSocket {
         websocket,
         selected_subprotocol,
+        response_cookies,
     })
 }
 
@@ -713,10 +737,12 @@ struct BackendHandshakeMetadata {
 struct BackendHandshakeHeaders {
     authorization: Option<HeaderValue>,
     websocket_protocols: Vec<HeaderValue>,
+    application: hyper::HeaderMap,
+    query: Option<String>,
 }
 
 impl BackendHandshakeHeaders {
-    fn from_downstream(request: &Request<Incoming>) -> Result<Self, AcceptError> {
+    fn from_downstream(request: &Request<Incoming>, route: &Route) -> Result<Self, AcceptError> {
         let mut authorizations = request.headers().get_all(AUTHORIZATION).iter();
         let authorization = authorizations.next().cloned();
         if authorizations.next().is_some() {
@@ -724,9 +750,50 @@ impl BackendHandshakeHeaders {
         }
         let websocket_protocols =
             request.headers().get_all(SEC_WEBSOCKET_PROTOCOL).iter().cloned().collect();
+        let mut application = hyper::HeaderMap::new();
+        if route.handshake().forward_cookie {
+            let cookies: Vec<_> = request
+                .headers()
+                .get_all("cookie")
+                .iter()
+                .map(|value| value.to_str())
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|_| AcceptError::InvalidApplicationHeaders)?;
+            if !cookies.is_empty() {
+                application.insert(
+                    "cookie",
+                    HeaderValue::from_str(&cookies.join("; "))
+                        .map_err(|_| AcceptError::InvalidApplicationHeaders)?,
+                );
+            }
+        }
+        if route.handshake().forward_origin {
+            let mut origins = request.headers().get_all("origin").iter();
+            if let Some(origin) = origins.next() {
+                if origins.next().is_some() {
+                    return Err(AcceptError::InvalidApplicationHeaders);
+                }
+                application.insert("origin", origin.clone());
+            }
+        }
+        for name in ["x-forwarded-for", "x-real-ip", "x-forwarded-proto", "cf-connecting-ip"] {
+            if let Some(value) = request.headers().get(name) {
+                application.insert(name, value.clone());
+            }
+        }
+        let authority = crate::http_proxy::headers::request_authority(request)
+            .map_err(|_| AcceptError::InvalidApplicationHeaders)?;
+        application.insert(
+            "x-forwarded-host",
+            HeaderValue::from_str(&authority)
+                .map_err(|_| AcceptError::InvalidApplicationHeaders)?,
+        );
+        let query = request.uri().query().map(str::to_owned);
         Ok(Self {
             authorization,
             websocket_protocols,
+            application,
+            query,
         })
     }
 }
@@ -735,6 +802,7 @@ enum BackendConnection {
     WebSocket {
         websocket: GatewayWebSocket,
         selected_subprotocol: Option<HeaderValue>,
+        response_cookies: Vec<HeaderValue>,
     },
     Tcp {
         stream: TcpStream,
@@ -742,6 +810,14 @@ enum BackendConnection {
 }
 
 impl BackendConnection {
+    fn response_cookies(&self) -> &[HeaderValue] {
+        match self {
+            Self::WebSocket {
+                response_cookies, ..
+            } => response_cookies,
+            Self::Tcp { .. } => &[],
+        }
+    }
     fn selected_subprotocol(&self) -> Option<&HeaderValue> {
         match self {
             Self::WebSocket {
@@ -778,6 +854,8 @@ pub(super) enum AcceptError {
     InvalidHandshake(#[source] WebSocketError),
     #[error("WebSocket request contains multiple Authorization headers")]
     AmbiguousAuthorization,
+    #[error("invalid or ambiguous application handshake headers")]
+    InvalidApplicationHeaders,
     #[error("gateway entered an invalid WebSocket handshake state")]
     InvalidInternalState,
     #[error("gateway is shutting down")]
@@ -794,7 +872,8 @@ impl AcceptError {
             Self::Http1UpgradeRequired => StatusCode::UPGRADE_REQUIRED,
             Self::Http2ExtendedConnectRequired
             | Self::InvalidHandshake(_)
-            | Self::AmbiguousAuthorization => StatusCode::BAD_REQUEST,
+            | Self::AmbiguousAuthorization
+            | Self::InvalidApplicationHeaders => StatusCode::BAD_REQUEST,
             Self::UnsupportedHttpVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             Self::InvalidInternalState => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
@@ -811,6 +890,7 @@ impl AcceptError {
             Self::UnsupportedHttpVersion => "unsupported websocket HTTP version\n",
             Self::InvalidHandshake(_) => "invalid websocket handshake\n",
             Self::AmbiguousAuthorization => "invalid websocket authorization headers\n",
+            Self::InvalidApplicationHeaders => "invalid websocket application headers\n",
             Self::InvalidInternalState => "internal websocket state error\n",
             Self::ShuttingDown => "gateway is shutting down\n",
             Self::BackendTimeout | Self::Backend(_) => "backend unavailable\n",
