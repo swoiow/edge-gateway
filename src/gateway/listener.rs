@@ -100,6 +100,7 @@ where
         Arc::clone(&server_config),
         cancellation.child_token(),
         observability.clone(),
+        Arc::clone(client_address.ip_blocking()),
     );
     let grpc_runtime = GrpcRuntime::new(
         grpc_routes,
@@ -117,6 +118,7 @@ where
     )
     .await?;
     let client_address_task = client_address.start(cancellation.child_token());
+    let mut ip_blocking_task = client_address.ip_blocking().start(cancellation.child_token());
     let transport_capacity = Arc::new(Semaphore::new(server_config.max_connections()));
     let handshake_capacity = Arc::new(Semaphore::new(
         server_config.max_concurrent_tls_handshakes(),
@@ -154,6 +156,8 @@ where
     );
 
     let mut connections = JoinSet::new();
+    let mut listener_failure = None;
+    let mut block_manager_finished = false;
     tokio::pin!(shutdown_signal);
 
     loop {
@@ -169,8 +173,22 @@ where
                     warn!(error = %error, "connection task terminated unexpectedly");
                 }
             }
+            completed = &mut ip_blocking_task => {
+                block_manager_finished = true;
+                listener_failure = Some(match completed {
+                    Ok(()) => anyhow::anyhow!("IP block manager stopped before listener shutdown"),
+                    Err(error) => anyhow::anyhow!("IP block manager failed: {error}"),
+                });
+                break;
+            }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted.context("failed to accept TCP connection")?;
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        listener_failure = Some(anyhow::Error::new(error).context("failed to accept TCP connection"));
+                        break;
+                    }
+                };
                 let transport_permit = match Arc::clone(&transport_capacity).try_acquire_owned() {
                     Ok(permit) => Arc::new(permit),
                     Err(_) => { log_admission_rejection(&observability, AdmissionRejection::ConnectionCapacity, peer); continue; }
@@ -240,9 +258,15 @@ where
     if let Err(error) = client_address_task.await {
         warn!(%error, "CF maintenance task terminated unexpectedly");
     }
+    if !block_manager_finished && let Err(error) = ip_blocking_task.await {
+        warn!(%error, "IP block manager terminated unexpectedly");
+    }
     observability_shutdown.cancel();
     observability_task.wait().await;
     info!("gateway shutdown complete");
+    if let Some(error) = listener_failure {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -473,21 +497,6 @@ async fn handle_request(
             text_response(StatusCode::FORBIDDEN, "forbidden\n")
         });
     }
-    let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
-        total
-            .saturating_add(name.as_str().len())
-            .saturating_add(value.as_bytes().len())
-            .saturating_add(32)
-    });
-    if request.headers().len() > state.server_config.max_http_header_count()
-        || header_bytes > state.server_config.max_http_header_bytes()
-    {
-        log_admission_rejection(&state.observability, AdmissionRejection::Headers, peer);
-        return Ok(text_response(
-            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            "headers too large\n",
-        ));
-    }
     let host = match resolve_request_host(&request) {
         Ok(host) => host,
         Err(_) => {
@@ -531,7 +540,7 @@ async fn handle_request(
     } else if let Some(fallback) = fallback {
         fallback.security()
     } else {
-        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
+        crate::security::RouteSecurity::default()
     };
     let client_address =
         match state.client_address.resolve_client_address(peer, request.headers(), security) {
@@ -545,6 +554,59 @@ async fn handle_request(
                 return Ok(text_response(StatusCode::FORBIDDEN, "forbidden\n"));
             }
         };
+    let blocking = state.client_address.ip_blocking();
+    if blocking.is_client_ip_blocked(client_address) {
+        return Ok(
+            if grpc_route.is_some() && request.version() == Version::HTTP_2 {
+                crate::grpc::blocked_grpc_response()
+            } else {
+                text_response(StatusCode::FORBIDDEN, "forbidden\n")
+            },
+        );
+    }
+    let header_bytes = request.headers().iter().fold(0usize, |total, (name, value)| {
+        total
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(32)
+    });
+    if request.headers().len() > state.server_config.max_http_header_count()
+        || header_bytes > state.server_config.max_http_header_bytes()
+    {
+        log_admission_rejection(&state.observability, AdmissionRejection::Headers, peer);
+        if websocket_route.is_some() || grpc_route.is_some() {
+            blocking.record_client_protocol_violation(
+                client_address,
+                crate::security::ViolationRule::SizeViolation,
+            );
+        }
+        return Ok(text_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "headers too large\n",
+        ));
+    }
+    if websocket_route.is_none()
+        && grpc_route.is_none()
+        && http_route.is_none()
+        && fallback.is_none()
+    {
+        if blocking.is_scan_namespace(path) {
+            blocking.record_client_protocol_violation(
+                client_address,
+                crate::security::ViolationRule::NamespaceScan,
+            );
+        }
+        return Ok(text_response(StatusCode::NOT_FOUND, "not found\n"));
+    }
+    if grpc_route.is_some()
+        && let Some(response) = crate::grpc::reject_invalid_grpc_request(&request)
+    {
+        blocking.record_client_protocol_violation(
+            client_address,
+            crate::security::ViolationRule::InvalidGrpc,
+        );
+        return Ok(response);
+    }
     let request_permit = match Arc::clone(&state.request_capacity).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -591,6 +653,12 @@ async fn handle_request(
         {
             Ok(response) => response,
             Err(error) => {
+                if error.is_client_protocol_violation() {
+                    blocking.record_client_protocol_violation(
+                        client_address,
+                        crate::security::ViolationRule::InvalidWebsocket,
+                    );
+                }
                 // Client rejections do not emit one warning per attacker request.
                 debug!(transport_connection_id, route_id = route.id(), host = route.host(),
                     %peer, client_ip = %client_address.client_ip,

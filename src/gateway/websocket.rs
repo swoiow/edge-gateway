@@ -47,6 +47,7 @@ pub(super) struct WebSocketRuntime {
     tasks: TaskTracker,
     executor: TrackedExecutor,
     observability: RuntimeObservability,
+    ip_blocking: Arc<crate::security::IpBlockingRuntime>,
 }
 
 impl WebSocketRuntime {
@@ -54,6 +55,7 @@ impl WebSocketRuntime {
         server_config: Arc<ServerConfig>,
         shutdown: CancellationToken,
         observability: RuntimeObservability,
+        ip_blocking: Arc<crate::security::IpBlockingRuntime>,
     ) -> Self {
         let tasks = TaskTracker::new();
         Self {
@@ -62,6 +64,7 @@ impl WebSocketRuntime {
             executor: TrackedExecutor(tasks.clone()),
             tasks,
             observability,
+            ip_blocking,
         }
     }
 
@@ -207,6 +210,7 @@ impl WebSocketRuntime {
                     backend,
                     RelayLaunchContext {
                         client_address,
+                        ip_blocking: Arc::clone(&self.ip_blocking),
                         admission: Arc::clone(&admission),
                         transport_connection_id,
                         connection_id,
@@ -228,6 +232,7 @@ impl WebSocketRuntime {
                     RelaySocket::from_io_halves(downstream_read, downstream_write, Role::Server);
                 let launch_context = RelayLaunchContext {
                     client_address,
+                    ip_blocking: Arc::clone(&self.ip_blocking),
                     admission: Arc::clone(&admission),
                     transport_connection_id,
                     connection_id,
@@ -451,6 +456,7 @@ async fn start_relay(
             connection_id: context.connection_id,
             peer: context.peer,
             client_address: context.client_address,
+            ip_blocking: context.ip_blocking,
             _admission: context.admission,
             route: context.route,
             cf_ray: context.cf_ray,
@@ -506,6 +512,7 @@ async fn start_tcp_bridge(
             connection_id: context.connection_id,
             peer: context.peer,
             client_address: context.client_address,
+            ip_blocking: context.ip_blocking,
             _admission: context.admission,
             route: context.route,
             cf_ray: context.cf_ray,
@@ -830,6 +837,7 @@ impl BackendConnection {
 }
 
 struct RelayLaunchContext {
+    ip_blocking: Arc<crate::security::IpBlockingRuntime>,
     client_address: ResolvedClientAddress,
     admission: Arc<RequestLease>,
     transport_connection_id: u64,
@@ -899,6 +907,18 @@ impl AcceptError {
 
     pub(super) const fn should_advertise_http1_upgrade(&self) -> bool {
         matches!(self, Self::Http1UpgradeRequired)
+    }
+
+    pub(super) const fn is_client_protocol_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::Http1UpgradeRequired
+                | Self::Http2ExtendedConnectRequired
+                | Self::UnsupportedHttpVersion
+                | Self::InvalidHandshake(_)
+                | Self::AmbiguousAuthorization
+                | Self::InvalidApplicationHeaders
+        )
     }
 
     pub(super) const fn is_backend_failure(&self) -> bool {

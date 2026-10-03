@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fastwebsockets::{
-    FragmentCollectorRead, Frame, OpCode, Role, WebSocket, WebSocketError, WebSocketRead,
-    WebSocketWrite, after_handshake_split,
+    Frame, OpCode, Role, WebSocket, WebSocketError, WebSocketRead, WebSocketWrite,
+    after_handshake_split,
 };
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -27,7 +27,33 @@ use crate::security::ResolvedClientAddress;
 
 type BoxedRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
 type BoxedWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
-type GatewayRead = FragmentCollectorRead<BoxedRead>;
+struct GatewayRead {
+    read: GatewaySocketRead,
+    messages: super::websocket_message::BoundedMessages,
+}
+impl GatewayRead {
+    fn new(read: GatewaySocketRead, maximum: usize) -> Self {
+        Self {
+            read,
+            messages: super::websocket_message::BoundedMessages::new(maximum),
+        }
+    }
+    async fn read_frame<R, E>(
+        &mut self,
+        send: &mut impl FnMut(Frame<'static>) -> R,
+    ) -> Result<Frame<'static>, WebSocketError>
+    where
+        R: std::future::Future<Output = Result<(), E>>,
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        loop {
+            let frame = self.read.read_frame(send).await?;
+            if let Some(message) = self.messages.collect(frame)? {
+                return Ok(message);
+            }
+        }
+    }
+}
 type GatewaySocketRead = WebSocketRead<BoxedRead>;
 type GatewayWrite = WebSocketWrite<BoxedWrite>;
 type SharedWriter = Arc<Mutex<GatewayWrite>>;
@@ -69,6 +95,7 @@ pub(super) struct ConnectionContext {
     pub(super) connection_id: u64,
     pub(super) peer: SocketAddr,
     pub(super) client_address: ResolvedClientAddress,
+    pub(super) ip_blocking: Arc<crate::security::IpBlockingRuntime>,
     pub(super) _admission: Arc<RequestLease>,
     pub(super) route: Arc<Route>,
     pub(super) cf_ray: Option<String>,
@@ -89,8 +116,8 @@ pub(super) async fn run(
     downstream.read.set_max_message_size(sdk_message_limit);
     backend.read.set_max_message_size(sdk_message_limit);
 
-    let downstream_read = FragmentCollectorRead::new(downstream.read);
-    let backend_read = FragmentCollectorRead::new(backend.read);
+    let downstream_read = GatewayRead::new(downstream.read, max_message_size);
+    let backend_read = GatewayRead::new(backend.read, max_message_size);
     let downstream_write = Arc::new(Mutex::new(downstream.write));
     let backend_write = Arc::new(Mutex::new(backend.write));
 
@@ -137,6 +164,7 @@ pub(super) async fn run(
         relay_cancellation.child_token(),
         Arc::clone(&client_to_backend),
         context.observability.clone(),
+        Some((Arc::clone(&context.ip_blocking), context.client_address)),
     ));
     pumps.spawn(pump(
         Direction::BackendToClient,
@@ -146,6 +174,7 @@ pub(super) async fn run(
         relay_cancellation.child_token(),
         Arc::clone(&backend_to_client),
         context.observability.clone(),
+        None,
     ));
 
     let observation_interval =
@@ -326,6 +355,8 @@ pub(super) async fn run_tcp_backend(
         relay_cancellation.child_token(),
         Arc::clone(&client_to_backend),
         context.observability.clone(),
+        Some((Arc::clone(&context.ip_blocking), context.client_address)),
+        max_message_size,
     ));
     pumps.spawn(pump_tcp_to_websocket(
         backend_read,
@@ -456,8 +487,14 @@ async fn pump_websocket_to_tcp(
     cancellation: CancellationToken,
     diagnostics: Arc<DirectionDiagnostics>,
     observability: RuntimeObservability,
+    client_abuse: Option<(
+        Arc<crate::security::IpBlockingRuntime>,
+        ResolvedClientAddress,
+    )>,
+    max_message_size: usize,
 ) -> PumpReport {
     let direction = Direction::ClientToBackend;
+    let mut messages = super::websocket_message::MessageSequence::new(max_message_size);
     loop {
         diagnostics.set_stage(RelayStage::AwaitingRead);
         let control_writer = Arc::clone(&own_writer);
@@ -497,11 +534,15 @@ async fn pump_websocket_to_tcp(
             result = reader.read_frame(&mut send_control) => {
                 match result {
                     Ok(frame) => frame,
-                    Err(error) => return PumpReport::error(direction, &diagnostics, error),
+                    Err(error) => { record_client_websocket_error(&client_abuse, &error); return PumpReport::error(direction, &diagnostics, error); },
                 }
             }
         };
 
+        if let Err(error) = messages.validate(&frame) {
+            record_client_websocket_error(&client_abuse, &error);
+            return PumpReport::error(direction, &diagnostics, error);
+        }
         match frame.opcode {
             // A TCP backend has byte-stream semantics, so WebSocket message and
             // fragment boundaries intentionally disappear at this boundary.
@@ -594,6 +635,10 @@ async fn pump(
     cancellation: CancellationToken,
     diagnostics: Arc<DirectionDiagnostics>,
     observability: RuntimeObservability,
+    client_abuse: Option<(
+        Arc<crate::security::IpBlockingRuntime>,
+        ResolvedClientAddress,
+    )>,
 ) -> PumpReport {
     loop {
         diagnostics.set_stage(RelayStage::AwaitingRead);
@@ -633,6 +678,7 @@ async fn pump(
                 match result {
                     Ok(frame) => frame,
                     Err(error) => {
+                        record_client_websocket_error(&client_abuse, &error);
                         return PumpReport::error(direction, &diagnostics, error);
                     }
                 }
@@ -1289,4 +1335,31 @@ struct ProgressTracker {
     forwarded_bytes: u64,
     idle_episode_reported: bool,
     no_progress_episode_reported: bool,
+}
+
+fn record_client_websocket_error(
+    client: &Option<(
+        Arc<crate::security::IpBlockingRuntime>,
+        ResolvedClientAddress,
+    )>,
+    error: &WebSocketError,
+) {
+    use crate::security::ViolationRule;
+    let rule = match error {
+        WebSocketError::FrameTooLarge | WebSocketError::PingFrameTooLarge => {
+            ViolationRule::SizeViolation
+        }
+        WebSocketError::InvalidFragment
+        | WebSocketError::InvalidUTF8
+        | WebSocketError::InvalidContinuationFrame
+        | WebSocketError::InvalidCloseFrame
+        | WebSocketError::InvalidCloseCode
+        | WebSocketError::ReservedBitsNotZero
+        | WebSocketError::ControlFrameFragmented
+        | WebSocketError::InvalidValue => ViolationRule::InvalidWebsocket,
+        _ => return,
+    };
+    if let Some((runtime, address)) = client {
+        runtime.record_client_protocol_violation(*address, rule);
+    }
 }

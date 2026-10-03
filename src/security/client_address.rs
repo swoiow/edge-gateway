@@ -28,17 +28,24 @@ pub(crate) struct ResolvedClientAddress {
 pub(crate) struct ClientAddressPolicy {
     cloudflare: Arc<CloudflareNetworks>,
     health_peer_networks: Vec<IpNetwork>,
+    ip_blocking: Arc<super::IpBlockingRuntime>,
 }
 
 impl ClientAddressPolicy {
     pub(crate) fn new(
         cloudflare: Arc<CloudflareNetworks>,
         health_peer_networks: Vec<IpNetwork>,
+        ip_blocking: Arc<super::IpBlockingRuntime>,
     ) -> Self {
         Self {
             cloudflare,
             health_peer_networks,
+            ip_blocking,
         }
+    }
+
+    pub(crate) fn ip_blocking(&self) -> &Arc<super::IpBlockingRuntime> {
+        &self.ip_blocking
     }
 
     pub(crate) fn start(&self, shutdown: CancellationToken) -> JoinHandle<()> {

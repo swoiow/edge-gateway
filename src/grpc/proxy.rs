@@ -132,20 +132,8 @@ impl GrpcRuntime {
         if self.shutdown.is_cancelled() {
             return grpc_failure_response("14", "gateway%20shutting%20down");
         }
-        if request.version() != Version::HTTP_2 {
-            return text_response(StatusCode::HTTP_VERSION_NOT_SUPPORTED, "HTTP/2 required\n");
-        }
-        if request.method() != Method::POST {
-            return text_response(StatusCode::METHOD_NOT_ALLOWED, "POST required\n");
-        }
-        if request.uri().query().is_some() {
-            return text_response(StatusCode::BAD_REQUEST, "query string is not allowed\n");
-        }
-        if !is_grpc_content_type(request.headers()) {
-            return text_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "application/grpc content-type required\n",
-            );
+        if let Some(response) = reject_invalid_grpc_request(&request) {
+            return response;
         }
 
         let Some(upstream) = self.upstreams.get(&route.backend().address()) else {
@@ -599,4 +587,38 @@ where
         let task = self.0.spawn(future);
         std::mem::drop(task);
     }
+}
+
+pub(crate) fn blocked_grpc_response() -> Response<ResponseBody> {
+    grpc_failure_response("7", "permission%20denied")
+}
+
+pub(crate) fn reject_invalid_grpc_request<B>(
+    request: &Request<B>,
+) -> Option<Response<ResponseBody>> {
+    if request.version() != Version::HTTP_2 {
+        return Some(text_response(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "HTTP/2 required\n",
+        ));
+    }
+    if request.method() != Method::POST {
+        return Some(text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST required\n",
+        ));
+    }
+    if request.uri().query().is_some() {
+        return Some(text_response(
+            StatusCode::BAD_REQUEST,
+            "query string is not allowed\n",
+        ));
+    }
+    if !is_grpc_content_type(request.headers()) {
+        return Some(text_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "application/grpc content-type required\n",
+        ));
+    }
+    None
 }

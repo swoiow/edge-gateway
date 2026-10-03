@@ -1318,12 +1318,14 @@ struct FileSecurityConfig {
     #[serde(default = "default_health_peer_cidrs")]
     health_peer_cidrs: Vec<String>,
     cloudflare: Option<FileCloudflareConfig>,
+    ip_blocking: crate::security::FileIpBlockingConfig,
 }
 impl Default for FileSecurityConfig {
     fn default() -> Self {
         Self {
             health_peer_cidrs: default_health_peer_cidrs(),
             cloudflare: None,
+            ip_blocking: crate::security::FileIpBlockingConfig::default(),
         }
     }
 }
@@ -1369,9 +1371,16 @@ impl FileSecurityConfig {
         } else {
             None
         };
+        let block_config = self
+            .ip_blocking
+            .validate(directory)
+            .map_err(|error| ConfigError::Invalid(format!("security.ip_blocking: {error:#}")))?;
+        let ip_blocking = crate::security::IpBlockingRuntime::load(block_config)
+            .await
+            .map_err(|error| ConfigError::Invalid(format!("security.ip_blocking: {error:#}")))?;
         let networks = CloudflareNetworks::load(cache_file)
             .await
             .map_err(|error| ConfigError::Invalid(format!("security.cloudflare: {error:#}")))?;
-        Ok(ClientAddressPolicy::new(networks, health))
+        Ok(ClientAddressPolicy::new(networks, health, ip_blocking))
     }
 }
